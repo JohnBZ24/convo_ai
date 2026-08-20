@@ -1,0 +1,14 @@
+packages:
+  - "apps/*"
+  - "packages/*"
+
+# pnpm 11 blocks postinstall scripts unless listed here. esbuild's postinstall
+# fetches its platform-specific binary; Vite and Vitest do not run without it.
+allowBuilds:
+  esbuild: true
+
+# pnpm 11 refuses packages published within its minimum-release-age window as a
+# supply-chain guard. vite@8.2.2 is newer than that window; pnpm recorded the
+# exception itself. Revisit when a settled 8.x is available.
+minimumReleaseAgeExclude:
+  - vite@8.2.2

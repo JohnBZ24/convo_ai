@@ -1,0 +1,10 @@
+# Normalise to LF in the repository. Without this, Windows checkouts commit CRLF
+# and every diff on a Mac/CI machine shows the whole file as changed.
+* text=auto eol=lf
+
+# Binary / generated
+pnpm-lock.yaml linguist-generated=true
+*.png binary
+*.jpg binary
+*.keystore binary
+*.jks binary

@@ -1,0 +1,25 @@
+{
+  "name": "convo-ai",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.22.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "server": "pnpm --filter @convo/server dev",
+    "verify": "turbo run lint typecheck --concurrency=2 && turbo run test --concurrency=1",
+    "lint": "turbo run lint --concurrency=2",
+    "typecheck": "turbo run typecheck --concurrency=2",
+    "test": "turbo run test --concurrency=1",
+    "format": "biome check --write .",
+    "db:generate": "pnpm --filter @convo/db db:generate",
+    "db:migrate": "pnpm --filter @convo/db db:migrate",
+    "db:check": "pnpm --filter @convo/db db:check"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.9",
+    "turbo": "2.10.11",
+    "typescript": "7.0.2"
+  }
+}
