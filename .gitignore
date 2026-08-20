@@ -28,3 +28,6 @@ ios/
 Thumbs.db
 *.log
 npm-debug.log*
+
+# TanStack Router generates this on every dev/build
+apps/server/src/routeTree.gen.ts

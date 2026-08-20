@@ -10,7 +10,7 @@
   "scripts": {
     "lint": "biome check .",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run",
+    "test": "vitest run --passWithNoTests",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
     "db:check": "tsx src/scripts/check-connection.ts"
@@ -20,6 +20,7 @@
     "postgres": "^3.4.9"
   },
   "devDependencies": {
+    "@types/node": "^26.2.0",
     "drizzle-kit": "^0.31.10",
     "tsx": "^4.23.12",
     "typescript": "7.0.2",
