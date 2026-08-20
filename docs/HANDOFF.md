@@ -32,32 +32,79 @@ apps/server/.env     RECOVERED — real OPENAI_API_KEY, DATABASE_URL,
 A backup copy of those, plus the recovered `apps/server/src/lib/security.ts`, is at
 `C:\Users\JBZLB\convo_ai_keep\`.
 
-### Before writing a single line, do these three things
+### The three things that had to happen first - status
 
-1. **`git init` and commit.** This is the whole reason the loss was total.
-2. **Move the project off the OneDrive path** to something short like
-   `C:\dev\convo_ai`. This fixes a real build blocker (see *Windows path length*
-   below) and keeps `node_modules` out of a synced folder.
-3. **Fix or stop relying on OneDrive sync.** It silently stopped in May. A backup
-   you cannot verify is not a backup.
+1. **`git init` and commit.** DONE 20 Aug 2026. Commit at every iteration boundary.
+2. **Move off the OneDrive path.** DONE - now `C:\convo_ai` (11 chars, better than
+   the `C:\dev\convo_ai` originally suggested). See *Windows path length* below.
+3. **Stop relying on OneDrive sync.** Still relevant: there is STILL NO REMOTE.
+   `gh` is not installed. A private GitHub repo remains the one real protection
+   against losing this machine.
 
 ## Build steps
 
-All steps must be rebuilt. Steps 1–3 were previously complete and verified against
-real OpenAI and real Postgres, so the design is proven even though the code is not
-recoverable.
+Steps 0 and 1 are rebuilt and committed. The original steps 1-3 had been verified
+against real OpenAI and real Postgres before the loss, so the design is proven
+even where the code had to be rewritten.
 
 | Step | What | State |
 |------|------|-------|
-| 1 | Backend foundation — workspace, env, DB, health/readiness, OpenAPI + Swagger | Rebuild |
-| 2 | Better Auth bearer tokens + conversations CRUD | Rebuild |
-| 3 | `packages/ai` + realtime token route + guarded tools endpoint | Rebuild |
-| 4 | Expo app scaffold + UI shell | Rebuild |
+| 0 | Repo safety: git, pnpm workspace, Turbo, Biome, tsconfig | **DONE** `263d7ea` |
+| 1 | Backend foundation: Clean Architecture, health/ready, generated Swagger | **DONE** `bccbde5` |
+| 2 | Better Auth bearer tokens + conversations CRUD | Next |
+| 3 | `packages/ai` + realtime token route + guarded tools endpoint | |
+| 4 | Expo app scaffold + UI shell + FIRST dev build on the Note 8 | |
 | 5 | WebRTC audio on a real device | |
-| 6 | One spoken turn end to end | |
-| 7 | Persistence wiring + history screen | |
-| 8 | Hardening: barge-in, session handoff, reconnects | |
-| 9 | Android dev build over USB, latency measured | |
+| 6 | Transcripts, persistence, history screen | |
+| 7 | Hardening + measured latency over USB | |
+
+## State as of 20 Aug 2026 (session 2)
+
+**Read `docs/DESIGN.md` for the design and `CLAUDE.md` for the architecture rules.**
+Both are current. This section is only what a new session cannot infer from them.
+
+Project now lives at **`C:\convo_ai`** (11 chars) - the short path is what unblocks
+the NDK/ninja 250-char limit in iteration 4. Git is initialised and committed.
+**No remote yet** - `gh` is not installed. A private GitHub repo is still wanted.
+
+Architecture was adapted from the **`tanstack-start-ca`** Clean Architecture
+boilerplate, kept for reference at `C:\coding	anstack-start-ca`. It uses
+`createServerFn`; we deliberately use REST server routes instead. See CLAUDE.md.
+
+### Things verified this session that save real time
+
+- **The database survived.** Only source was destroyed. `convo` already had the
+  Better Auth tables (`user`, `session`, `account`, `verification`) before
+  iteration 1 ran. Iteration 2 does not need to create them.
+- **`import.meta.glob` works in TanStack Start's server build.** This is what the
+  OpenAPI document is built on - no registry, no drift test.
+- **Zod 4 has native `z.toJSONSchema()`** covering OpenAPI 3.1. No zod-to-openapi
+  dependency. Use `io:"input"` for request bodies and `io:"output"` for responses.
+- **Vite binds IPv6 only by default.** `vite.config.ts` now pins
+  `host: "127.0.0.1"`. Do NOT remove it: `adb reverse` forwards to the host's
+  IPv4 loopback, so without this the phone gets connection-refused in iteration 4.
+- **`@tanstack/react-start@1.168.x` depends on `@tanstack/react-router@1.170.31`
+  directly.** The version gap is independent versioning, NOT an incompatibility.
+- **`@types/react-dom` does not track `react`'s version** (react 19.2.8, its types
+  19.2.4). A bad version spec makes pnpm abort mid-download and emit
+  `UND_ERR_DESTROYED` plus a libuv crash - that noise is the ABORT, not a network
+  fault. Check the version spec before blaming the network.
+- **pnpm 11 gates postinstall scripts and very new packages.** `allowBuilds` and
+  `minimumReleaseAgeExclude` in `pnpm-workspace.yaml`; esbuild needs the former or
+  Vite and Vitest do not run.
+
+### Environment limits on this machine
+
+- **The Postgres service cannot be stopped without elevation.** To test the
+  readiness 503 path end to end, run `net stop postgresql-x64-18` from an
+  elevated shell yourself. Otherwise point `DATABASE_URL` at a dead port, which
+  exercises the same path.
+- **Browser automation cannot reach this machine's localhost.** Chrome shows an
+  error page (and sometimes an unrelated local app's 404) for `127.0.0.1:3000`
+  while curl succeeds. Verify HTTP behaviour with curl, and ask the user to open
+  pages themselves. Use `127.0.0.1`, not `localhost`.
+- Something else of the user's occupies port 3000 intermittently (a Next.js app
+  called "JuiceHedz"). Check `netstat` before assuming a server is yours.
 
 ## What steps 1–3 contained
 
