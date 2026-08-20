@@ -1,6 +1,7 @@
-import { z } from "zod";
 import { env } from "~/config/env";
 import type { DocumentedHandler } from "~/presentation/http/define-handler";
+import { AUTH_TAG, buildAuthOperations } from "./auth-operations";
+import { toSchema } from "./zod-to-openapi";
 
 /**
  * Builds the OpenAPI 3.1 document by DISCOVERING controllers, not by reading a
@@ -25,26 +26,33 @@ function isDocumentedHandler(value: unknown): value is DocumentedHandler {
 }
 
 /**
- * OpenAPI 3.1 IS JSON Schema draft 2020-12, so Zod's native converter is a
- * direct fit and no zod-to-openapi dependency is needed.
+ * Query parameters, with `required` taken from the schema rather than assumed.
  *
- * `io` is the subtle part. A schema with `.default()` or `.transform()` has a
- * DIFFERENT shape going in than coming out - `limit` is optional in a request
- * but always present in a response. Getting this wrong publishes docs that
- * quietly lie about which fields are required.
+ * A field with `.default()` is OPTIONAL in a request even though it is always
+ * present in the parsed result, which is why this reads the `required` list off
+ * the input-side conversion instead of listing every property.
  */
-function toSchema(schema: z.ZodType, io: "input" | "output") {
-  return z.toJSONSchema(schema, {
-    target: "draft-2020-12",
-    io,
-    // Dates and similar have no JSON Schema equivalent; describe them loosely
-    // rather than refusing to generate the document at all.
-    unrepresentable: "any",
-  }) as Record<string, unknown>;
+function queryParameters(query: DocumentedHandler["spec"]["query"]) {
+  if (!query) return [];
+
+  const converted = toSchema(query, "input");
+  const required = (converted.required as string[] | undefined) ?? [];
+
+  return Object.entries(converted.properties ?? {}).map(([name, schema]) => ({
+    name,
+    in: "query" as const,
+    required: required.includes(name),
+    schema,
+  }));
 }
 
 export function buildOpenApiDocument() {
-  const paths: Record<string, Record<string, unknown>> = {};
+  /**
+   * Seeded with the auth operations, which are hand-written because Better
+   * Auth serves them through a bare splat and there is no spec to discover.
+   * Everything after this point is generated. See auth-operations.ts.
+   */
+  const paths: Record<string, Record<string, unknown>> = buildAuthOperations();
 
   for (const module of Object.values(controllerModules)) {
     for (const exported of Object.values(module)) {
@@ -63,20 +71,7 @@ export function buildOpenApiDocument() {
               }),
             )
           : []),
-        ...(spec.query
-          ? Object.entries(toSchema(spec.query, "input").properties ?? {}).map(
-              ([name, schema]) => ({
-                name,
-                in: "query" as const,
-                required: (
-                  (toSchema(spec.query as z.ZodType, "input").required as
-                    | string[]
-                    | undefined) ?? []
-                ).includes(name),
-                schema,
-              }),
-            )
-          : []),
+        ...queryParameters(spec.query),
       ];
 
       const responses = Object.fromEntries(
@@ -131,6 +126,7 @@ export function buildOpenApiDocument() {
     servers: [{ url: env.BETTER_AUTH_URL, description: "This instance" }],
     tags: [
       { name: "health", description: "Liveness and readiness probes" },
+      AUTH_TAG,
       { name: "conversations", description: "Conversation and turn persistence" },
       { name: "realtime", description: "Ephemeral OpenAI credential minting" },
       { name: "tools", description: "Privileged tools the model may invoke" },

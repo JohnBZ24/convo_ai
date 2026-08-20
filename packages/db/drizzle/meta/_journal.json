@@ -8,6 +8,20 @@
       "when": 1787227953440,
       "tag": "0000_stormy_nocturne",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1787230244298,
+      "tag": "0001_marvelous_nextwave",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1787231812729,
+      "tag": "0002_tricky_trish_tilby",
+      "breakpoints": true
     }
   ]
 }

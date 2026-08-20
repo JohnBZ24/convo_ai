@@ -13,7 +13,8 @@
     "test": "vitest run --passWithNoTests",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
-    "db:check": "tsx src/scripts/check-connection.ts"
+    "db:check": "tsx src/scripts/check-connection.ts",
+    "db:baseline": "tsx src/scripts/baseline.ts"
   },
   "dependencies": {
     "drizzle-orm": "^0.45.2",

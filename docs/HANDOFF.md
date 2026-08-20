@@ -1,4 +1,4 @@
-# Handoff — 20 Aug 2026
+# Handoff — 20 Aug 2026 (session 3)
 
 Read `CLAUDE.md` first for the architecture rules; this file is state, not design.
 
@@ -29,6 +29,12 @@ apps/server/.env     RECOVERED — real OPENAI_API_KEY, DATABASE_URL,
                      BETTER_AUTH_SECRET, BETTER_AUTH_URL
 ```
 
+`CLAUDE.md` was then **emptied by accident** in iteration 1's commit (`bccbde5`
+deleted all 122 lines) and went unnoticed until iteration 2, because this file
+tells you to read it first and it silently had nothing in it. It has been restored
+from `263d7ea` and rewritten to match the Clean Architecture that iteration 1
+actually built. If a session ever finds it empty again, `git show 263d7ea:CLAUDE.md`.
+
 A backup copy of those, plus the recovered `apps/server/src/lib/security.ts`, is at
 `C:\Users\JBZLB\convo_ai_keep\`.
 
@@ -51,14 +57,14 @@ even where the code had to be rewritten.
 |------|------|-------|
 | 0 | Repo safety: git, pnpm workspace, Turbo, Biome, tsconfig | **DONE** `263d7ea` |
 | 1 | Backend foundation: Clean Architecture, health/ready, generated Swagger | **DONE** `bccbde5` |
-| 2 | Better Auth bearer tokens + conversations CRUD | Next |
-| 3 | `packages/ai` + realtime token route + guarded tools endpoint | |
+| 2 | Better Auth bearer tokens + conversations CRUD | **DONE** |
+| 3 | `packages/ai` + realtime token route + guarded tools endpoint | Next |
 | 4 | Expo app scaffold + UI shell + FIRST dev build on the Note 8 | |
 | 5 | WebRTC audio on a real device | |
 | 6 | Transcripts, persistence, history screen | |
 | 7 | Hardening + measured latency over USB | |
 
-## State as of 20 Aug 2026 (session 2)
+## State as of 20 Aug 2026 (sessions 2-3)
 
 **Read `docs/DESIGN.md` for the design and `CLAUDE.md` for the architecture rules.**
 Both are current. This section is only what a new session cannot infer from them.
@@ -73,9 +79,38 @@ boilerplate, kept for reference at `C:\coding	anstack-start-ca`. It uses
 
 ### Things verified this session that save real time
 
-- **The database survived.** Only source was destroyed. `convo` already had the
-  Better Auth tables (`user`, `session`, `account`, `verification`) before
-  iteration 1 ran. Iteration 2 does not need to create them.
+- **The database "surviving" was a trap - now resolved. Read this before
+  touching the schema.** The claim in earlier versions of this file, that the
+  `convo` database was usable as-is, was only ever true of the *names* of the
+  tables. In fact:
+  - The Better Auth tables were built under **Better Auth 1.6** and lacked
+    `account.issuer`, which 1.7 requires. Every sign-up returned 500 with
+    *The field "issuer" does not exist in the "account" Drizzle schema*.
+  - `conversations`, `turns`, `realtime_sessions` and `tool_invocations` were
+    still the **destroyed project's** schema: `turns` had no `ended_at`, `role`
+    and `status` were Postgres ENUMS rather than text, and there were telemetry
+    columns (`audio_ms`, `ms_to_first_audio`, `interrupted`, `model`,
+    `input_tokens`, `output_tokens`) that iteration 1 deliberately dropped.
+  - Iteration 1's migration `0000` had therefore **never actually been applied**,
+    and `drizzle.__drizzle_migrations` still held two rows from the dead project,
+    so `db:migrate` would have tried to CREATE TABLE over live tables.
+
+  Fixed in iteration 2: the four app tables were dumped to
+  `C:\Users\JBZLB\convo_ai_keep\legacy-tables-20260820.sql` (23 rows, with the
+  enum types prepended by hand so the file actually restores), dropped, and
+  recreated from `0000`. The Better Auth tables were **kept** - they hold the real
+  accounts - and migrated in place by `0002`. **The database and
+  `packages/db/src/schema` now match exactly.** Verified column by column.
+- **`pnpm db:baseline` is new** (`packages/db/src/scripts/baseline.ts`). It marks
+  journal entries as applied without running them. Needed because drizzle applies
+  every migration whose journal timestamp is newer than the newest ledger row -
+  so a database that is already correct but has no matching ledger cannot be
+  migrated at all. Only correct when the schema genuinely already matches.
+- **Migration `0002` is hand-edited and must stay that way.** drizzle-kit emits
+  `ADD COLUMN "issuer" text NOT NULL`, which cannot run against a populated
+  table. It was rewritten as add-nullable / backfill `'local:' || provider_id` /
+  SET NOT NULL. That backfill reproduces Better Auth's `createLocalAccountIssuer`
+  exactly.
 - **`import.meta.glob` works in TanStack Start's server build.** This is what the
   OpenAPI document is built on - no registry, no drift test.
 - **Zod 4 has native `z.toJSONSchema()`** covering OpenAPI 3.1. No zod-to-openapi
@@ -104,9 +139,65 @@ boilerplate, kept for reference at `C:\coding	anstack-start-ca`. It uses
   while curl succeeds. Verify HTTP behaviour with curl, and ask the user to open
   pages themselves. Use `127.0.0.1`, not `localhost`.
 - Something else of the user's occupies port 3000 intermittently (a Next.js app
-  called "JuiceHedz"). Check `netstat` before assuming a server is yours.
+  called "JuiceHedz"). Check `netstat` before assuming a server is yours - but
+  the dev server from a PREVIOUS session may also still be on 3000. Confirm with
+  `(Get-CimInstance Win32_Process -Filter 'ProcessId=<pid>').CommandLine` before
+  killing anything.
+- **`vite.config.ts` sets `strictPort: true`.** To run a second server whose logs
+  you can actually read, use
+  `pnpm --filter @convo/server exec vite dev --port 3001`. The first request
+  after start takes ~40s to compile - give curl a generous `-m`.
+- **pg_dump / psql live at `C:\Program Files\PostgreSQL\18\bin\`** and are not on
+  PATH. `pg_dump -t <table>` does NOT follow the table's dependent enum types;
+  add the `CREATE TYPE` statements by hand or the dump will not restore.
 
-## What steps 1–3 contained
+## What iteration 2 actually built
+
+Structure follows iteration 1's Clean Architecture, not the flat `services/` +
+`lib/` layout the pre-loss code used. `CLAUDE.md` has the full map; the parts
+worth knowing before iteration 3:
+
+- **Guards are TanStack middleware that can return a Response.** Returning one
+  short-circuits the chain, so the handler never runs. `renderApiError` is
+  exported from `define-handler.ts` so a guard's 401 is byte-identical to a
+  handler's.
+- **Middleware declares its own dependencies** —
+  `createMiddleware().middleware([requestContextMiddleware])`. That is what TYPES
+  `context.requestId` and `context.user` downstream, and TanStack's
+  `flattenMiddlewares` dedupes by identity, so listing a middleware in a stack as
+  well costs nothing. `rateLimitMiddleware` depends on `requireUserMiddleware`,
+  which makes "keyed by the authenticated user" a compile-time fact.
+- **The core throws `ApplicationError`, never `ApiError`.** `defineHandler` maps
+  `not-found` → 404, `invalid-input` → 400, `conflict` → 409. A use case importing
+  from `presentation/` would point the dependency arrow the wrong way.
+- **`requiresAuth: true` does two jobs**: the Swagger padlock and the runtime 401.
+  A route wired without its guard fails closed.
+- **`scripts/exit-test.sh` runs the whole DESIGN exit test with curl.** Start the
+  server, run it, read the statuses. It is the only thing that exercises real
+  Postgres end to end - extend it in iteration 3 rather than starting over.
+- **The rate limiter is built and tested but not yet wired to a route** -
+  `realtimeMintStack` and `toolCallStack` in `stacks.ts` are ready for iteration 3.
+- **Auth operations in Swagger are HAND-WRITTEN** (`openapi/auth-operations.ts`),
+  because Better Auth serves them from a bare splat and there is no spec to
+  discover. They are the only hand-written part of the document, and
+  `document.test.ts` excludes them by name so the exclusion stays visible.
+
+### Traps hit while building it
+
+- **postgres.js will not bind a `Date` inside a raw `sql` fragment.** It throws
+  *The "string" argument must be of type string ... Received an instance of Date*,
+  which Drizzle then wraps as "Failed query: ...". Bind
+  `date.toISOString()` and keep the `::timestamptz` cast - the cast is
+  load-bearing, not decoration. This broke page 2 of pagination only, so it did
+  not show up until a cursor was actually used.
+- **Drizzle hides the real error in `cause`.** `define-handler.ts` now logs the
+  whole cause chain; without it the log says "Failed query" and nothing about why.
+- Index routes match without a trailing slash: `routes/api/conversations/index.ts`
+  serves `/api/conversations`. Use `$id/index.ts` + `$id/turns.ts`, NOT
+  `$id.ts` + `$id.turns.ts` - the dotted form makes `$id` a parent route, whose
+  middleware would then run a second time for `turns`.
+
+## What step 3 still contains
 
 Rebuild to this shape. It was working.
 
@@ -124,12 +215,10 @@ Rebuild to this shape. It was working.
 | `POST /api/realtime/token` | Mint credential. Rate limited 20/hour/user. |
 | `POST /api/tools/:name` | Execute a privileged tool. Rate limited 120/min/user. |
 
-Services: `conversations.ts`, `realtime.ts`, `tools/index.ts` (three distinct
-refusals — unknown → 404, device-execution → 403, declared-without-handler → 500),
-`tools/handlers.ts`. Lib: `auth.ts`, `env.ts` (with an `optional()` helper, because
-blank env values are empty strings not `undefined`), `http.ts`, `logger.ts`,
-`openai.ts`, `openapi.ts`, `security.ts` (recovered — see the backup folder).
-Guards: `require-user.ts`, `rate-limit.ts`.
+The first seven rows are DONE. Only `/api/realtime/token` and `/api/tools/:name`
+remain, plus `security.ts` (recovered — see the backup folder), which iteration 1
+did not reinstate: the current `infrastructure/security/headers.ts` was written
+fresh. Check whether the recovered file has anything the new one lacks.
 
 **`packages/db`** — four tables: `conversations` (denormalised `turnCount` /
 `lastTurnAt`), `turns` (**unique index on `(conversationId, seq)`** — this is what
@@ -144,13 +233,15 @@ read return 404 rather than 403.
 voice `marin`. Two tools: `get_current_time` (device) and `search_conversations`
 (privileged).
 
-**`packages/shared`** — Zod contracts plus the `RouteDoc` registry. The OpenAPI
-document is generated from the same schemas the handlers validate with, so it
-cannot drift.
+**`packages/shared`** — Zod contracts. There is no `RouteDoc` registry any more:
+the document is discovered from the controllers with `import.meta.glob`, so there
+is no registration step to forget.
 
-**Tests** — 74 passing: 18 server, 21 ai, 24 db, 11 shared. The most valuable was
-`openapi.registry.test.ts` (15 tests): it walks `src/routes/api` on disk and fails
-if any route file lacks a RouteDoc or vice versa.
+**Tests** — 93 passing after iteration 2: 70 server, 15 shared, 8 db. The
+successor to the old `openapi.registry.test.ts` is
+`tests/presentation/openapi/document.test.ts` — it still walks `src/routes/api`
+ON DISK and fails if a route is undocumented or a document entry has no route.
+Keep that property when adding endpoints.
 
 ## Frontend design — settled, do not relitigate
 
@@ -261,6 +352,8 @@ those options. `metro.config.js` should exist only for Bundle Mode.
 
 ### Auth — probed against the running server
 
+Everything below was re-confirmed against the iteration-2 server on 20 Aug.
+
 - The bearer token arrives in the **`set-auth-token` response header**. The body
   also carries a `token`, and the two **differ** (the header has a signature
   suffix) — but **both authenticate**, so read the header and fall back to the body.
@@ -298,8 +391,18 @@ those options. `metro.config.js` should exist only for Bundle Mode.
 
 ## Known gaps, deliberately
 
-- **Rate limiting was in-process memory.** With more than one server instance the
-  effective limit becomes `limit × instances`. Move to Redis before scaling out.
+- **Rate limiting is in-process memory.** With more than one server instance the
+  effective limit becomes `limit × instances`. The `RateLimiter` port exists
+  precisely so this is a new class in `infrastructure/rate-limiting` and one line
+  in the container - move to Redis before scaling out.
+- **Sessions are never pruned.** Better Auth writes a row per sign-in with a
+  30-day expiry and nothing deletes the expired ones. Harmless at this size;
+  worth a job before this is more than a demo.
+- **No integration test touches Postgres.** Every test runs against the in-memory
+  repository, so the transaction in `appendTurn` and the row-value keyset
+  predicate are covered by the curl exit test and by nothing automated. That is
+  what let the `Date`-binding bug reach a running server. A single suite against a
+  throwaway database would close it.
 - **No `packages/ai` handler for tools beyond `search_conversations`.** A tool
   declared privileged with no handler failed a test, so this could not rot silently.
 - **`services/tools/handlers.ts` needs splitting** into one file per tool once there
