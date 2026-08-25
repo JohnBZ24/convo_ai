@@ -4,6 +4,7 @@ import type {
   ConversationPage,
   ConversationRepository,
   ListConversationsOptions,
+  SearchConversationsOptions,
 } from "~/core/application/ports/conversation-repository.port";
 import { Conversation } from "~/core/domain/entities/conversation.entity";
 import { Turn } from "~/core/domain/entities/turn.entity";
@@ -84,6 +85,34 @@ export class InMemoryConversationRepository implements ConversationRepository {
       items: remaining.slice(0, options.limit),
       hasMore: remaining.length > options.limit,
     };
+  }
+
+  /**
+   * Mirrors the SQL: case-insensitive substring over the title OR any turn's
+   * text, scoped by user, newest first, capped.
+   *
+   * Wildcards are LITERAL here, because the real implementation escapes them
+   * before they reach the LIKE pattern. A fake that let "%" match everything
+   * would quietly stop testing the thing that matters most about this method.
+   */
+  async search(
+    userId: string,
+    options: SearchConversationsOptions,
+  ): Promise<Conversation[]> {
+    const needle = options.query.toLowerCase();
+
+    const matches = (conversation: Conversation) => {
+      if (conversation.title?.toLowerCase().includes(needle)) return true;
+
+      return (this.turns.get(conversation.id) ?? []).some((turn) =>
+        turn.text.toLowerCase().includes(needle),
+      );
+    };
+
+    return [...this.conversations.values()]
+      .filter((conversation) => conversation.userId === userId && matches(conversation))
+      .sort((a, b) => b.startedAt.getTime() - a.startedAt.getTime())
+      .slice(0, options.limit);
   }
 
   async end(userId: string, id: string, at: Date): Promise<Conversation | null> {

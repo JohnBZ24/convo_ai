@@ -11,7 +11,12 @@
  * out of the presentation layer, and only the ones a use case genuinely knows
  * belong in it.
  */
-export type ApplicationErrorKind = "not-found" | "invalid-input" | "conflict";
+export type ApplicationErrorKind =
+  | "not-found"
+  | "invalid-input"
+  | "conflict"
+  | "forbidden"
+  | "upstream-failure";
 
 export class ApplicationError extends Error {
   constructor(
@@ -41,6 +46,31 @@ export class ApplicationError extends Error {
 
   static conflict(message: string, details?: unknown) {
     return new ApplicationError("conflict", message, details);
+  }
+
+  /**
+   * Understood, and refused on policy grounds - NOT an ownership failure.
+   *
+   * The one caller is "this tool runs on the device, so the server will not
+   * proxy it". That is safe to state plainly because the tool registry is
+   * already public knowledge: the model was handed the whole list when the
+   * session was minted, so naming one leaks nothing. Ownership failures stay
+   * `notFound`, for the reason given above.
+   */
+  static forbidden(message: string, details?: unknown) {
+    return new ApplicationError("forbidden", message, details);
+  }
+
+  /**
+   * A service we depend on failed - a distinct fact from "we have a bug".
+   *
+   * Without this kind, an OpenAI outage surfaces as a 500 saying "an unexpected
+   * error occurred", which sends whoever is debugging it into this codebase
+   * instead of at the status page. The core still names no status code; it
+   * names the CAUSE, and the edge maps it to 502.
+   */
+  static upstreamFailure(message: string, details?: unknown) {
+    return new ApplicationError("upstream-failure", message, details);
   }
 }
 

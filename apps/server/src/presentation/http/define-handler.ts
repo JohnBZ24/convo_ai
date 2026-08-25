@@ -108,6 +108,14 @@ const APPLICATION_ERROR_STATUS: Record<
   "not-found": (error) => ApiError.notFound(error.message),
   "invalid-input": (error) => ApiError.badRequest(error.message, error.details),
   conflict: (error) => ApiError.conflict(error.message, error.details),
+  forbidden: (error) => ApiError.forbidden(error.message),
+  /**
+   * 502, not 500. The distinction is the whole reason the kind exists: a 500
+   * says "our bug, look in this codebase", a 502 says "the service behind us
+   * failed, look there". The upstream's own message is NOT forwarded - it may
+   * carry request internals - so only our summary reaches the caller.
+   */
+  "upstream-failure": (error) => ApiError.upstream(error.message, error.details),
 };
 
 export function renderApiError(error: ApiError, requestId: string): Response {

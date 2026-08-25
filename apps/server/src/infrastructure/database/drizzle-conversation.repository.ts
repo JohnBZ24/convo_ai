@@ -1,11 +1,12 @@
 import { type Database, schema } from "@convo/db";
-import { and, desc, eq, sql } from "drizzle-orm";
+import { and, desc, eq, exists, ilike, or, sql } from "drizzle-orm";
 import type {
   AppendTurnInput,
   AppendTurnResult,
   ConversationPage,
   ConversationRepository,
   ListConversationsOptions,
+  SearchConversationsOptions,
 } from "~/core/application/ports/conversation-repository.port";
 import { Conversation } from "~/core/domain/entities/conversation.entity";
 import { Turn } from "~/core/domain/entities/turn.entity";
@@ -26,6 +27,20 @@ function toConversation(row: ConversationRow): Conversation {
     startedAt: row.startedAt,
     endedAt: row.endedAt,
   });
+}
+
+/**
+ * Neutralise LIKE metacharacters in text supplied by the MODEL.
+ *
+ * Without this, a query of "%" matches every conversation the user has and a
+ * search becomes a full history dump - the exact outcome a prompt injection
+ * would be aiming for. Not an injection risk in the SQL sense (the pattern is
+ * still a bound parameter), but a wildcard is a wildcard.
+ *
+ * The backslash goes first, or it would re-escape the escapes added after it.
+ */
+function escapeLikePattern(query: string): string {
+  return query.replace(/\\/g, "\\\\").replace(/[%_]/g, "\\$&");
 }
 
 function toTurn(row: TurnRow): Turn {
@@ -123,6 +138,47 @@ export class DrizzleConversationRepository implements ConversationRepository {
       items: rows.slice(0, limit).map(toConversation),
       hasMore: rows.length > limit,
     };
+  }
+
+  async search(
+    userId: string,
+    options: SearchConversationsOptions,
+  ): Promise<Conversation[]> {
+    const pattern = `%${escapeLikePattern(options.query)}%`;
+
+    /**
+     * EXISTS rather than a JOIN + DISTINCT: a conversation with forty matching
+     * turns should appear once, and EXISTS stops at the first hit instead of
+     * building every matching pair only to collapse them again.
+     *
+     * KNOWN LIMITATION: `ilike` cannot use a b-tree index, so this scans the
+     * user's turns. Correct at this size and honest about it - the fix when it
+     * matters is a tsvector column with a GIN index, which is a migration and a
+     * change to this one method. See docs/HANDOFF.md.
+     */
+    const mentionedInATurn = exists(
+      this.database
+        .select({ matched: sql`1` })
+        .from(turns)
+        .where(
+          and(eq(turns.conversationId, conversations.id), ilike(turns.text, pattern)),
+        ),
+    );
+
+    const rows = await this.database
+      .select()
+      .from(conversations)
+      .where(
+        and(
+          // Ownership in the predicate, as everywhere else in this class.
+          eq(conversations.userId, userId),
+          or(ilike(conversations.title, pattern), mentionedInATurn),
+        ),
+      )
+      .orderBy(desc(conversations.startedAt), desc(conversations.id))
+      .limit(options.limit);
+
+    return rows.map(toConversation);
   }
 
   async end(userId: string, id: string, at: Date): Promise<Conversation | null> {

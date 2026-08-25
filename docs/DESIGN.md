@@ -1,7 +1,19 @@
 # Convo AI — Design & Build Plan
 
-**Status:** design agreed 20 Aug 2026. No code written yet.
+**Status:** design agreed 20 Aug 2026. **Iterations 0–3 are built** (backend
+complete); iteration 4 — the Expo app and the first dev build on the Note 8 — is next.
 **Read order:** `CLAUDE.md` (rules) → this file (design) → `HANDOFF.md` (verified facts, gotchas).
+
+> Two parts of this file describe a design that iteration 1 deliberately
+> replaced, and are kept only because the *reasoning* still holds. Where they
+> disagree with the code, the code wins:
+> - §3 and §6 describe a **`RouteDoc` registry** and a four-step "register it in
+>   `lib/openapi.ts`" flow. There is no registry: `document.ts` discovers every
+>   `*.controller.ts` with `import.meta.glob`, so there is no registration step
+>   to forget. The *test* described in §6 does still exist and still walks the
+>   route directory on disk.
+> - §3's NestJS table maps `@Controller` to the route file and services to
+>   `services/*.ts`. The real layout is Clean Architecture — see `CLAUDE.md`.
 
 This document is the design the build follows. `HANDOFF.md` stays what it is — a
 record of things already proven against real OpenAI, real Postgres and the real
@@ -392,16 +404,23 @@ voice `marin`, and two tools — `get_current_time` (device) and
 `search_conversations` (privileged). `REALTIME_MODEL` / `REALTIME_VOICE` /
 `DOCS_ENABLED` get added to `.env` and `.env.example`.
 
-**⚠ Verify before coding:** `gpt-realtime-2.1`, its mini variant, and the
-`/v1/realtime/client_secrets` endpoint shape all come from `HANDOFF.md` (18–20 Aug).
-My knowledge cutoff is May 2026, so I check them against `GET /v1/models` and the
-live docs first rather than guessing.
+**⚠ Verify before coding — DONE 25 Aug 2026.** `GET /v1/models` confirms
+`gpt-realtime-2`, `gpt-realtime-2.1` and `gpt-realtime-2.1-mini` all exist; the
+`/v1/realtime/client_secrets` request and response shapes were confirmed by
+POSTing the generated body for real. Full findings in `HANDOFF.md`.
 
-**Exit test — through Swagger, against real OpenAI:**
-- mint a credential → real `ek_…`, `expiresAt` ≈ 60s out
-- `search_conversations` → returns **only your own** conversations
-- `get_current_time` → **403** (device tool) · unknown name → **404**
-- 21st token inside an hour → **429**
+**Exit test — through Swagger, against real OpenAI: PASSED 25 Aug 2026.**
+Automated in `scripts/exit-test.sh`, which now covers iterations 2 and 3.
+- mint a credential → real `ek_…`, `expiresInSeconds: 59` ✓
+- `search_conversations` → returns **only your own** conversations ✓
+- `get_current_time` → **403** (device tool) · unknown name → **404** ✓
+- 20th token inside an hour → **429** with `retry-after: 3586` ✓
+  (20th, not 21st: a *failed* mint still spends budget, because the limiter is
+  middleware and runs before the handler rejects the request. Deliberate —
+  probing has to cost the prober.)
+- Added beyond the stated test, because the endpoint deserves it: a caller
+  passing another user's `userId` in the tool arguments gets **zero matches**,
+  and a `query` of `"%"` matches nothing rather than dumping the history.
 
 ---
 
@@ -563,9 +582,12 @@ Condensed from `HANDOFF.md`; that file has the full detail and the reasoning.
 
 ## 11. Open items
 
-1. **Private GitHub repo** — either install `gh` and sign in, or create an empty
-   private repo and hand over the URL. Nothing is pushed anywhere without a say-so.
-   *(blocks the push half of iteration 0, not the commit half)*
-2. **Confirm the mini model's exact id** against `GET /v1/models` rather than
-   assuming the name. *(blocks iteration 3)*
-3. **Set the OpenAI dashboard usage limit** — this one is yours to click.
+1. ~~**Private GitHub repo**~~ — DONE. `origin` is
+   `https://github.com/JohnBZ24/convo_ai.git`. Push at every iteration boundary.
+2. ~~**Confirm the mini model's exact id**~~ — DONE 25 Aug 2026 against
+   `GET /v1/models`: it is **`gpt-realtime-2.1-mini`**. Switching is one `.env`
+   line, no redeploy.
+3. **Set the OpenAI dashboard usage limit** — this one is yours to click, and it
+   is now the ONLY protection the app cannot provide itself. The app-side limits
+   (60s TTL, `max_output_tokens: 1200`, 20 mints/hour/user) do not cap a mistake
+   in a loop.

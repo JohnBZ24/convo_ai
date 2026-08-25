@@ -12,6 +12,7 @@
     "test": "vitest run --passWithNoTests"
   },
   "dependencies": {
+    "@convo/ai": "workspace:*",
     "@convo/db": "workspace:*",
     "@convo/shared": "workspace:*",
     "@tanstack/react-router": "1.170.31",

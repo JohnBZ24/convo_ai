@@ -1,3 +1,11 @@
+import {
+  CLIENT_SECRET_TTL_MAX_SECONDS,
+  CLIENT_SECRET_TTL_MIN_SECONDS,
+  CLIENT_SECRET_TTL_SECONDS,
+  DEFAULT_REALTIME_MODEL,
+  DEFAULT_REALTIME_VOICE,
+  REALTIME_VOICES,
+} from "@convo/ai";
 import { z } from "zod";
 
 /**
@@ -7,8 +15,17 @@ import { z } from "zod";
  *
  * Rediscovering this cost real time once already; see docs/HANDOFF.md.
  */
-function optional<T extends z.ZodType>(schema: T) {
-  return z.preprocess((value) => (value === "" ? undefined : value), schema.optional());
+const blankToUndefined = (value: unknown) => (value === "" ? undefined : value);
+
+/**
+ * A value that falls back when the variable is absent OR blank.
+ *
+ * The default lives HERE rather than at the call site, so downstream code gets
+ * a plain `string`/`number` and never has to re-decide the fallback - which is
+ * how two call sites end up disagreeing about what the default was.
+ */
+function withDefault<T extends z.ZodType>(schema: T) {
+  return z.preprocess(blankToUndefined, schema);
 }
 
 function booleanish(defaultValue: boolean) {
@@ -27,12 +44,49 @@ const envSchema = z.object({
 
   /**
    * Server-only. Exchanged for a short-lived client secret; never sent to the
-   * device. Not used until iteration 3, but validated now so a broken
-   * environment fails at boot rather than mid-demo.
+   * device.
    */
   OPENAI_API_KEY: z.string().min(1, "OPENAI_API_KEY is required"),
-  REALTIME_MODEL: optional(z.string()),
-  REALTIME_VOICE: optional(z.string()),
+
+  /**
+   * Where the realtime endpoints live. Configurable so a proxy, a regional
+   * host or a local mock is an environment change - and because the device is
+   * TOLD this value (as `callsUrl`), pointing the server elsewhere moves both
+   * halves of the flow at once instead of half of it.
+   */
+  OPENAI_BASE_URL: withDefault(z.url().default("https://api.openai.com/v1")),
+
+  /** Any id from `GET /v1/models`. Pinned here so the model changes without a release. */
+  REALTIME_MODEL: withDefault(z.string().min(1).default(DEFAULT_REALTIME_MODEL)),
+
+  /**
+   * Validated against the enumerated voices rather than accepted as any
+   * string. A typo would otherwise be discovered by OpenAI, sixty seconds into
+   * a demo, as a failed mint and an orb that spins forever.
+   */
+  REALTIME_VOICE: withDefault(z.enum(REALTIME_VOICES).default(DEFAULT_REALTIME_VOICE)),
+
+  /**
+   * How long a minted credential lives. The API accepts 10-7200; the bounds are
+   * imported from `@convo/ai` rather than retyped, so they cannot drift from
+   * what the provider actually enforces. Short is safer - see the constant.
+   */
+  REALTIME_CLIENT_SECRET_TTL_SECONDS: withDefault(
+    z.coerce
+      .number()
+      .int()
+      .min(CLIENT_SECRET_TTL_MIN_SECONDS)
+      .max(CLIENT_SECRET_TTL_MAX_SECONDS)
+      .default(CLIENT_SECRET_TTL_SECONDS),
+  ),
+
+  /**
+   * A hung mint is worse than a failed one: the user is holding a phone with a
+   * spinning orb. Bounded so the app can offer a retry instead of hanging.
+   */
+  OPENAI_REQUEST_TIMEOUT_MS: withDefault(
+    z.coerce.number().int().min(1000).max(60_000).default(10_000),
+  ),
 
   BETTER_AUTH_SECRET: z.string().min(1, "BETTER_AUTH_SECRET is required"),
   BETTER_AUTH_URL: z.string().min(1, "BETTER_AUTH_URL is required"),
@@ -56,3 +110,5 @@ if (!parsed.success) {
 export const env = parsed.data;
 export const isProduction = env.NODE_ENV === "production";
 export const isDevelopment = env.NODE_ENV === "development";
+
+export type Env = typeof env;

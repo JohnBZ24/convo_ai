@@ -52,6 +52,16 @@ export interface AppendTurnResult {
   replayed: boolean;
 }
 
+export interface SearchConversationsOptions {
+  /**
+   * Raw text from the MODEL. Treat it as hostile: the implementation must
+   * escape LIKE wildcards, because a query of "%" would otherwise match every
+   * row this user has and turn a search into a full history dump.
+   */
+  query: string;
+  limit: number;
+}
+
 export interface ConversationRepository {
   create(userId: string): Promise<Conversation>;
 
@@ -68,6 +78,16 @@ export interface ConversationRepository {
    * Already-ended conversations are returned unchanged - see Conversation.end.
    */
   end(userId: string, id: string, at: Date): Promise<Conversation | null>;
+
+  /**
+   * Conversations of THIS user matching `query`, newest first.
+   *
+   * Backs the `search_conversations` tool. `userId` is the first parameter for
+   * the same reason it is on every method here: it is part of the predicate,
+   * not a filter applied afterwards, so another user's conversation is never in
+   * the result set to be leaked.
+   */
+  search(userId: string, options: SearchConversationsOptions): Promise<Conversation[]>;
 
   /** Null when the conversation is not this user's. */
   appendTurn(

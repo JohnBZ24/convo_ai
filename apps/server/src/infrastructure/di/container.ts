@@ -3,7 +3,11 @@ import { env } from "~/config/env";
 import type { ConversationRepository } from "~/core/application/ports/conversation-repository.port";
 import type { HealthProbe } from "~/core/application/ports/health-probe.port";
 import type { RateLimiter } from "~/core/application/ports/rate-limiter.port";
+import type { RealtimeCredentialMinter } from "~/core/application/ports/realtime-credential-minter.port";
+import type { RealtimeSessionRepository } from "~/core/application/ports/realtime-session-repository.port";
 import type { SessionAuthenticator } from "~/core/application/ports/session-authenticator.port";
+import type { ToolHandlerRegistry } from "~/core/application/ports/tool-handler.port";
+import type { ToolInvocationRepository } from "~/core/application/ports/tool-invocation-repository.port";
 import { AppendTurnUseCase } from "~/core/application/use-cases/conversations/append-turn.use-case";
 import { EndConversationUseCase } from "~/core/application/use-cases/conversations/end-conversation.use-case";
 import { GetConversationUseCase } from "~/core/application/use-cases/conversations/get-conversation.use-case";
@@ -11,11 +15,20 @@ import { ListConversationsUseCase } from "~/core/application/use-cases/conversat
 import { StartConversationUseCase } from "~/core/application/use-cases/conversations/start-conversation.use-case";
 import { CheckLivenessUseCase } from "~/core/application/use-cases/health/check-liveness.use-case";
 import { CheckReadinessUseCase } from "~/core/application/use-cases/health/check-readiness.use-case";
+import { MintRealtimeCredentialUseCase } from "~/core/application/use-cases/realtime/mint-realtime-credential.use-case";
+import { ExecuteToolUseCase } from "~/core/application/use-cases/tools/execute-tool.use-case";
+import {
+  SEARCH_CONVERSATIONS_TOOL_NAME,
+  SearchConversationsUseCase,
+} from "~/core/application/use-cases/tools/search-conversations.use-case";
 import { BetterAuthSessionAuthenticator } from "~/infrastructure/auth/better-auth-session.authenticator";
 import { db } from "~/infrastructure/database/database";
 import { DrizzleConversationRepository } from "~/infrastructure/database/drizzle-conversation.repository";
 import { DrizzleHealthProbe } from "~/infrastructure/database/drizzle-health.probe";
+import { DrizzleRealtimeSessionRepository } from "~/infrastructure/database/drizzle-realtime-session.repository";
+import { DrizzleToolInvocationRepository } from "~/infrastructure/database/drizzle-tool-invocation.repository";
 import { InMemoryRateLimiter } from "~/infrastructure/rate-limiting/in-memory-rate-limiter";
+import { OpenAiRealtimeMinter } from "~/infrastructure/realtime/openai-realtime.minter";
 
 /**
  * Everything the presentation layer is allowed to reach for.
@@ -28,8 +41,17 @@ export interface Dependencies {
   database: Database;
   healthProbes: readonly HealthProbe[];
   conversationRepository: ConversationRepository;
+  realtimeSessionRepository: RealtimeSessionRepository;
+  toolInvocationRepository: ToolInvocationRepository;
   sessionAuthenticator: SessionAuthenticator;
   rateLimiter: RateLimiter;
+  realtimeCredentialMinter: RealtimeCredentialMinter;
+  /**
+   * Tool name -> implementation. A tool declared privileged in `@convo/ai` with
+   * no entry here is a 500 by design, and a test asserts it - so adding a
+   * declaration without an implementation cannot ship quietly.
+   */
+  toolHandlers: ToolHandlerRegistry;
 
   checkLiveness: CheckLivenessUseCase;
   checkReadiness: CheckReadinessUseCase;
@@ -38,6 +60,8 @@ export interface Dependencies {
   getConversation: GetConversationUseCase;
   endConversation: EndConversationUseCase;
   appendTurn: AppendTurnUseCase;
+  mintRealtimeCredential: MintRealtimeCredentialUseCase;
+  executeTool: ExecuteToolUseCase;
 }
 
 /**
@@ -59,14 +83,44 @@ export function createContainer(overrides: Partial<Dependencies> = {}): Dependen
   const healthProbes = overrides.healthProbes ?? [new DrizzleHealthProbe(database)];
   const conversationRepository =
     overrides.conversationRepository ?? new DrizzleConversationRepository(database);
+  const realtimeSessionRepository =
+    overrides.realtimeSessionRepository ??
+    new DrizzleRealtimeSessionRepository(database);
+  const toolInvocationRepository =
+    overrides.toolInvocationRepository ?? new DrizzleToolInvocationRepository(database);
+
+  /**
+   * Every knob comes from validated configuration, so switching model, voice or
+   * even the API host is an environment change and a restart - not a release.
+   */
+  const realtimeCredentialMinter =
+    overrides.realtimeCredentialMinter ??
+    new OpenAiRealtimeMinter({
+      apiKey: env.OPENAI_API_KEY,
+      baseUrl: env.OPENAI_BASE_URL,
+      ttlSeconds: env.REALTIME_CLIENT_SECRET_TTL_SECONDS,
+      requestTimeoutMs: env.OPENAI_REQUEST_TIMEOUT_MS,
+    });
+
+  const toolHandlers =
+    overrides.toolHandlers ??
+    ({
+      [SEARCH_CONVERSATIONS_TOOL_NAME]: new SearchConversationsUseCase(
+        conversationRepository,
+      ),
+    } satisfies ToolHandlerRegistry);
 
   return {
     database,
     healthProbes,
     conversationRepository,
+    realtimeSessionRepository,
+    toolInvocationRepository,
     sessionAuthenticator:
       overrides.sessionAuthenticator ?? new BetterAuthSessionAuthenticator(),
     rateLimiter: overrides.rateLimiter ?? new InMemoryRateLimiter(),
+    realtimeCredentialMinter,
+    toolHandlers,
 
     checkLiveness: overrides.checkLiveness ?? new CheckLivenessUseCase(env.APP_VERSION),
     checkReadiness: overrides.checkReadiness ?? new CheckReadinessUseCase(healthProbes),
@@ -81,6 +135,17 @@ export function createContainer(overrides: Partial<Dependencies> = {}): Dependen
     endConversation:
       overrides.endConversation ?? new EndConversationUseCase(conversationRepository),
     appendTurn: overrides.appendTurn ?? new AppendTurnUseCase(conversationRepository),
+    mintRealtimeCredential:
+      overrides.mintRealtimeCredential ??
+      new MintRealtimeCredentialUseCase(
+        realtimeCredentialMinter,
+        realtimeSessionRepository,
+        conversationRepository,
+        { model: env.REALTIME_MODEL, voice: env.REALTIME_VOICE },
+      ),
+    executeTool:
+      overrides.executeTool ??
+      new ExecuteToolUseCase(toolHandlers, toolInvocationRepository),
   };
 }
 

@@ -1,21 +1,24 @@
 #!/usr/bin/env bash
 #
-# The iteration 2 exit test from docs/DESIGN.md, as a script.
+# The iteration 2 AND 3 exit tests from docs/DESIGN.md, as a script.
 #
 #   pnpm server          # in another terminal
 #   bash scripts/exit-test.sh
 #
 # Every assertion is printed with its status code rather than asserted on, so a
 # human reads the output - this complements the unit suite rather than replacing
-# it, and it is the ONLY thing that exercises real Postgres end to end (see
-# "Known gaps" in docs/HANDOFF.md). Each run signs up new accounts, so it is safe
-# to run repeatedly.
+# it, and it is the ONLY thing that exercises real Postgres and real OpenAI end
+# to end (see "Known gaps" in docs/HANDOFF.md). Each run signs up new accounts,
+# so it is safe to run repeatedly.
 #
 # What to look for:
 #   201 create - 201 first turn - 200 replayed with turnCount unchanged
 #   404 (never 403) when the other account reads it
 #   ended twice with the SAME endedAt
 #   no id appearing on both pages of the keyset listing
+#   201 mint with a real ek_... and ~60s of life
+#   403 for a device tool, 404 for an invented one, replayed:true on a retry
+#   429 on the 21st mint within the hour
 set -u
 BASE=http://127.0.0.1:3000
 STAMP=$(date +%s)
@@ -99,3 +102,98 @@ curl -s -m 20 -w "\n<- %{http_code}\n" -X POST "$BASE/api/conversations/$CID/tur
 
 hdr "no token (expect 401)"
 curl -s -m 20 -w "\n<- %{http_code}\n" "$BASE/api/conversations"
+
+# ---------------------------------------------------------------------------
+# Iteration 3 - realtime credentials and privileged tools
+#
+# Minting a client secret is FREE; only spending one on an actual audio session
+# costs. So this section is safe to run repeatedly against the real API.
+# ---------------------------------------------------------------------------
+
+hdr "mint a realtime credential (expect 201, a real ek_..., ~60s of life)"
+MINT=$(curl -s -m 30 -w "\n<- %{http_code}" -X POST "$BASE/api/realtime/token" \
+  -H "authorization: Bearer $TA" -H 'content-type: application/json' -d '{}')
+echo "$MINT" | sed -E 's/"clientSecret":"(ek_.{6})[^"]*"/"clientSecret":"\1...REDACTED"/'
+echo "$MINT" | grep -q '"clientSecret":"ek_' \
+  && echo "OK: upstream returned a real ephemeral credential" \
+  || echo "FAIL: no ek_ credential in the response"
+
+hdr "mint against a conversation that is NOT yours (expect 404, and no spend)"
+curl -s -m 30 -w "\n<- %{http_code}\n" -X POST "$BASE/api/realtime/token" \
+  -H "authorization: Bearer $TB" -H 'content-type: application/json' \
+  -d "{\"conversationId\":\"$CID\"}"
+
+hdr "mint against a conversation that IS yours (expect 201)"
+curl -s -m 30 -o /dev/null -w "<- %{http_code}\n" -X POST "$BASE/api/realtime/token" \
+  -H "authorization: Bearer $TA" -H 'content-type: application/json' \
+  -d "{\"conversationId\":\"$CID\"}"
+
+hdr "device tool proxied to the server (expect 403 - the phone must run it)"
+curl -s -m 20 -w "\n<- %{http_code}\n" -X POST "$BASE/api/tools/get_current_time" \
+  -H "authorization: Bearer $TA" -H 'content-type: application/json' \
+  -d '{"callId":"call_device_1","arguments":{}}'
+
+hdr "tool the model invented (expect 404)"
+curl -s -m 20 -w "\n<- %{http_code}\n" -X POST "$BASE/api/tools/exfiltrate_everything" \
+  -H "authorization: Bearer $TA" -H 'content-type: application/json' \
+  -d '{"callId":"call_fake_1","arguments":{}}'
+
+hdr "search_conversations as A (expect 200, finds A's Mount Fuji conversation)"
+curl -s -m 20 -w "\n<- %{http_code}\n" -X POST "$BASE/api/tools/search_conversations" \
+  -H "authorization: Bearer $TA" -H 'content-type: application/json' \
+  -d '{"callId":"call_search_1","arguments":{"query":"mountain"}}'
+
+hdr "SAME callId again (expect 200 with replayed:true - a retried tool call)"
+curl -s -m 20 -w "\n<- %{http_code}\n" -X POST "$BASE/api/tools/search_conversations" \
+  -H "authorization: Bearer $TA" -H 'content-type: application/json' \
+  -d '{"callId":"call_search_1","arguments":{"query":"mountain"}}'
+
+hdr "PROMPT INJECTION: B searches, passing A's userId (expect 200, ZERO matches)"
+echo "The model can pass any userId it likes; the server takes identity from the"
+echo "session, so this must return an empty matches array - not A's conversation."
+curl -s -m 20 -w "\n<- %{http_code}\n" -X POST "$BASE/api/tools/search_conversations" \
+  -H "authorization: Bearer $TB" -H 'content-type: application/json' \
+  -d '{"callId":"call_inject_1","arguments":{"query":"mountain","userId":"whatever","user_id":"whatever"}}'
+
+hdr "wildcard query cannot dump the history (expect matches only for a literal %)"
+curl -s -m 20 -w "\n<- %{http_code}\n" -X POST "$BASE/api/tools/search_conversations" \
+  -H "authorization: Bearer $TA" -H 'content-type: application/json' \
+  -d '{"callId":"call_wildcard_1","arguments":{"query":"%"}}'
+
+hdr "bad tool arguments (expect 400 with field detail)"
+curl -s -m 20 -w "\n<- %{http_code}\n" -X POST "$BASE/api/tools/search_conversations" \
+  -H "authorization: Bearer $TA" -H 'content-type: application/json' \
+  -d '{"callId":"call_bad_1","arguments":{"query":""}}'
+
+hdr "tools without a token (expect 401)"
+curl -s -m 20 -w "\n<- %{http_code}\n" -X POST "$BASE/api/tools/search_conversations" \
+  -H 'content-type: application/json' -d '{"callId":"call_anon","arguments":{"query":"x"}}'
+
+hdr "rate limit: user B mints until the 20/hour budget runs out (expect 429)"
+# B has already spent ONE of the 20. The failed mint above - the 404 for
+# someone else's conversation - still consumed budget, because the limiter is
+# middleware and runs BEFORE the handler that decides the request is invalid.
+# That is deliberate: a caller probing conversation ids must burn their own
+# budget doing it, or the limit would not bound the work an attacker can cause.
+# So expect 19 successes here and a 429 on the 20th.
+echo "B has already spent 1 of 20 on the failed mint above - see the comment."
+for i in $(seq 1 21); do
+  CODE=$(curl -s -m 30 -o /dev/null -w "%{http_code}" -X POST "$BASE/api/realtime/token" \
+    -H "authorization: Bearer $TB" -H 'content-type: application/json' -d '{}')
+  printf "  mint %2d -> %s\n" "$i" "$CODE"
+  if [ "$CODE" = "429" ]; then
+    echo "  retry-after header:"
+    curl -s -m 30 -D - -o /dev/null -X POST "$BASE/api/realtime/token" \
+      -H "authorization: Bearer $TB" -H 'content-type: application/json' -d '{}' \
+      | tr -d '\r' | grep -i '^retry-after:'
+    break
+  fi
+done
+
+hdr "the rate limit is PER USER - A is unaffected (expect 201)"
+curl -s -m 30 -o /dev/null -w "<- %{http_code}\n" -X POST "$BASE/api/realtime/token" \
+  -H "authorization: Bearer $TA" -H 'content-type: application/json' -d '{}'
+
+hdr "both new endpoints are in the published OpenAPI document"
+curl -s -m 20 "$BASE/api/openapi" \
+  | grep -oE '"/api/(realtime/token|tools/\{name\})"' | sort -u

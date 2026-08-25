@@ -43,9 +43,12 @@ A backup copy of those, plus the recovered `apps/server/src/lib/security.ts`, is
 1. **`git init` and commit.** DONE 20 Aug 2026. Commit at every iteration boundary.
 2. **Move off the OneDrive path.** DONE - now `C:\convo_ai` (11 chars, better than
    the `C:\dev\convo_ai` originally suggested). See *Windows path length* below.
-3. **Stop relying on OneDrive sync.** Still relevant: there is STILL NO REMOTE.
-   `gh` is not installed. A private GitHub repo remains the one real protection
-   against losing this machine.
+3. **Stop relying on OneDrive sync.** DONE as of iteration 3 - the remote is
+   `https://github.com/JohnBZ24/convo_ai.git` and `origin/main` is current.
+   `gh` is still not installed; the remote was added by hand, so pushes use
+   whatever credential helper git has. **Push at every iteration boundary** -
+   iteration 2 sat committed-but-unpushed for a whole session, which is exactly
+   the state this project was destroyed in once already.
 
 ## Build steps
 
@@ -58,8 +61,8 @@ even where the code had to be rewritten.
 | 0 | Repo safety: git, pnpm workspace, Turbo, Biome, tsconfig | **DONE** `263d7ea` |
 | 1 | Backend foundation: Clean Architecture, health/ready, generated Swagger | **DONE** `bccbde5` |
 | 2 | Better Auth bearer tokens + conversations CRUD | **DONE** |
-| 3 | `packages/ai` + realtime token route + guarded tools endpoint | Next |
-| 4 | Expo app scaffold + UI shell + FIRST dev build on the Note 8 | |
+| 3 | `packages/ai` + realtime token route + guarded tools endpoint | **DONE** |
+| 4 | Expo app scaffold + UI shell + FIRST dev build on the Note 8 | Next |
 | 5 | WebRTC audio on a real device | |
 | 6 | Transcripts, persistence, history screen | |
 | 7 | Hardening + measured latency over USB | |
@@ -168,15 +171,16 @@ worth knowing before iteration 3:
   well costs nothing. `rateLimitMiddleware` depends on `requireUserMiddleware`,
   which makes "keyed by the authenticated user" a compile-time fact.
 - **The core throws `ApplicationError`, never `ApiError`.** `defineHandler` maps
-  `not-found` → 404, `invalid-input` → 400, `conflict` → 409. A use case importing
+  `not-found` → 404, `invalid-input` → 400, `conflict` → 409, and (added in
+  iteration 3) `forbidden` → 403, `upstream-failure` → 502. A use case importing
   from `presentation/` would point the dependency arrow the wrong way.
 - **`requiresAuth: true` does two jobs**: the Swagger padlock and the runtime 401.
   A route wired without its guard fails closed.
 - **`scripts/exit-test.sh` runs the whole DESIGN exit test with curl.** Start the
   server, run it, read the statuses. It is the only thing that exercises real
   Postgres end to end - extend it in iteration 3 rather than starting over.
-- **The rate limiter is built and tested but not yet wired to a route** -
-  `realtimeMintStack` and `toolCallStack` in `stacks.ts` are ready for iteration 3.
+- **The rate limiter is built and tested.** `realtimeMintStack` and
+  `toolCallStack` in `stacks.ts` were wired to their routes in iteration 3.
 - **Auth operations in Swagger are HAND-WRITTEN** (`openapi/auth-operations.ts`),
   because Better Auth serves them from a bare splat and there is no spec to
   discover. They are the only hand-written part of the document, and
@@ -197,9 +201,91 @@ worth knowing before iteration 3:
   `$id.ts` + `$id.turns.ts` - the dotted form makes `$id` a parent route, whose
   middleware would then run a second time for `turns`.
 
-## What step 3 still contains
+## What iteration 3 actually built
 
-Rebuild to this shape. It was working.
+`packages/ai`, `POST /api/realtime/token`, `POST /api/tools/:name`. Every claim
+below was checked against the LIVE OpenAI API and the running server on
+25 Aug 2026, not against my knowledge cutoff.
+
+### The OpenAI realtime API, verified live
+
+- **Model ids that exist right now** (`GET /v1/models`, filtered): `gpt-realtime`,
+  `gpt-realtime-1.5`, `gpt-realtime-2`, `gpt-realtime-2.1`,
+  `gpt-realtime-2.1-mini`, `gpt-realtime-mini`, `gpt-realtime-2025-08-28`,
+  `gpt-realtime-translate`, `gpt-realtime-whisper`. **`.env` pins
+  `gpt-realtime-2`.** The mini variant for cheap dev work is
+  `gpt-realtime-2.1-mini` — one `.env` line, no redeploy.
+- **`POST /v1/realtime/client_secrets` returns** `{ value: "ek_...", expires_at:
+  <epoch SECONDS>, session: { id: "sess_...", model, audio: { output: { voice } },
+  ... } }`. `expires_at` is seconds, not millis — the minter multiplies by 1000.
+- **`expires_after` is `{ anchor: "created_at", seconds: N }` with N in 10..7200**,
+  defaulting to 600. Those bounds are exported from `@convo/ai` and imported by
+  `config/env.ts`, so the env validation cannot drift from what the API enforces.
+- **The default voice is already `marin`** and the default turn detection is
+  already `server_vad` with the exact values in `DEFAULT_TURN_DETECTION`. They
+  are restated explicitly anyway, so an upstream default change cannot silently
+  alter how the app feels.
+- **`audio.input.transcription`** is what produces the USER's side of the
+  transcript. Without it only the assistant's half could ever be stored — worth
+  knowing before iteration 6. `gpt-4o-mini-transcribe` accepted.
+- **`noise_reduction: { type: "near_field" }`** accepted; the API's own default
+  is `null`.
+- The whole generated body was POSTed for real: 200, a live `ek_`, TTL exactly
+  60s, both tools echoed back. `packages/ai/src/realtime/session.test.ts` pins
+  that shape, so it is a regression test for a request known to work.
+
+### Design decisions worth not relitigating
+
+- **`packages/ai` declares, the server performs.** `buildClientSecretRequest` is
+  a pure function returning the request body; `OpenAiRealtimeMinter` owns only
+  transport (URL, timeout, failure translation). That split is what lets the
+  mobile app import the same tool declarations it will be asked to execute.
+- **One Zod schema per tool does three jobs**: it generates the JSON Schema
+  OpenAI is given, it validates the arguments that come back, and it types the
+  handler. A tool whose declared and accepted parameters could disagree would
+  fail mid-sentence on a device.
+- **`z.toJSONSchema` emits `$schema`, which must be STRIPPED** for OpenAI tool
+  parameters, and `additionalProperties: false` must be ADDED so the model does
+  not invent fields. See `toParameterSchema`.
+- **The idempotency key is `${userId}:${callId}`, not `callId`.**
+  `tool_invocations.idempotency_key` is globally unique but OpenAI's `call_id`
+  is only unique within one session — unscoped, two users could collide and one
+  would silently be told "replayed".
+- **The key deduplicates the AUDIT ROW, not the work.** A retried tool call runs
+  again and returns a fresh result with `replayed: true`. That is safe because
+  both current tools are READS. A mutating privileged tool would need to cache
+  its own result first — stated on `ToolHandler` so it cannot be missed.
+- **Search returns titles and dates, never transcripts.** Returning what was
+  said would put a user's whole history one prompt injection away and flood the
+  model's context to answer "which conversation was that?".
+- **`escapeLikePattern` neutralises `%` and `_`** in the model's query. Without
+  it a query of `"%"` matches everything the user has — verified in the exit
+  test, which now sends exactly that and expects zero matches.
+
+### Traps hit while building it
+
+- **The rate limit is consumed BEFORE ownership is checked**, because the
+  limiter is middleware and the handler runs after it. So a mint for someone
+  else's conversation returns 404 *and* costs the caller one of their 20. That
+  is correct — probing must cost the prober — but it surprised the exit test,
+  which now expects 19 successes rather than 20.
+- **`routeTree.gen.ts` must be regenerated before `pnpm typecheck` passes.** A
+  new route file fails with *Argument of type '"/api/tools/$name"' is not
+  assignable to parameter of type 'keyof FileRoutesByPath'* until the TanStack
+  plugin has run. Start the dev server once; it regenerates on boot.
+- **This machine's Bash tool mangles backslashes inside heredocs.** A
+  `cat > file <<'EOF'` containing `/\\/g` lands on disk as `/\/g`, which is an
+  invalid regex, and the same happens through a Python heredoc. Anything with a
+  backslash in it must be written with an editor tool, not a shell heredoc. This
+  silently corrupted `escapeLikePattern` twice before it was noticed.
+- **`vi.fn(async () => ...)` types its call tuple as `[]`.** Every assertion
+  about the request that was sent then fails to compile with *Tuple type '[]' of
+  length '0' has no element at index '0'*. Declare the parameters on the stub
+  even when it ignores them.
+
+## The API as built
+
+All of it exists now. Kept as the one-page map of the surface.
 
 **`apps/server`** (TanStack Start) — routes are thin parse-and-delegate shells:
 
@@ -215,10 +301,13 @@ Rebuild to this shape. It was working.
 | `POST /api/realtime/token` | Mint credential. Rate limited 20/hour/user. |
 | `POST /api/tools/:name` | Execute a privileged tool. Rate limited 120/min/user. |
 
-The first seven rows are DONE. Only `/api/realtime/token` and `/api/tools/:name`
-remain, plus `security.ts` (recovered — see the backup folder), which iteration 1
-did not reinstate: the current `infrastructure/security/headers.ts` was written
-fresh. Check whether the recovered file has anything the new one lacks.
+Every row is DONE as of iteration 3.
+
+Still outstanding from the pre-loss code: `security.ts` (recovered — see the
+backup folder) was never reinstated, because iteration 1 wrote
+`infrastructure/security/headers.ts` fresh instead. Nothing depends on it and
+the new file covers CORS + the baseline headers, but nobody has diffed the two
+to see whether the recovered one had anything extra. Worth ten minutes.
 
 **`packages/db`** — four tables: `conversations` (denormalised `turnCount` /
 `lastTurnAt`), `turns` (**unique index on `(conversationId, seq)`** — this is what
@@ -229,16 +318,20 @@ takes `userId` and puts it in the WHERE clause** — that is what makes a cross-
 read return 404 rather than 403.
 
 **`packages/ai`** — declaration only, never executes. `CLIENT_SECRET_TTL_SECONDS = 60`,
-`max_output_tokens: 1200`, `server_vad`, default model `gpt-realtime-2.1`, default
-voice `marin`. Two tools: `get_current_time` (device) and `search_conversations`
-(privileged).
+`MAX_OUTPUT_TOKENS = 1200`, `DEFAULT_TURN_DETECTION` (server_vad, barge-in on),
+`DEFAULT_REALTIME_MODEL = "gpt-realtime-2.1"`, `DEFAULT_REALTIME_VOICE = "marin"` —
+all overridable from the environment, and `.env` currently pins
+`REALTIME_MODEL=gpt-realtime-2`. `buildClientSecretRequest()` is the pure function
+that produces the credential request body. Two tools: `get_current_time` (device)
+and `search_conversations` (privileged). Imported by the server AND, later, by the
+mobile app — so it must never gain a server-only dependency.
 
 **`packages/shared`** — Zod contracts. There is no `RouteDoc` registry any more:
 the document is discovered from the controllers with `import.meta.glob`, so there
 is no registration step to forget.
 
-**Tests** — 93 passing after iteration 2: 70 server, 15 shared, 8 db. The
-successor to the old `openapi.registry.test.ts` is
+**Tests** — 179 passing after iteration 3: 119 server, 28 shared, 24 ai, 8 db.
+(93 after iteration 2.) The successor to the old `openapi.registry.test.ts` is
 `tests/presentation/openapi/document.test.ts` — it still walks `src/routes/api`
 ON DISK and fails if a route is undocumented or a document entry has no route.
 Keep that property when adding endpoints.
@@ -399,14 +492,28 @@ Everything below was re-confirmed against the iteration-2 server on 20 Aug.
   30-day expiry and nothing deletes the expired ones. Harmless at this size;
   worth a job before this is more than a demo.
 - **No integration test touches Postgres.** Every test runs against the in-memory
-  repository, so the transaction in `appendTurn` and the row-value keyset
-  predicate are covered by the curl exit test and by nothing automated. That is
-  what let the `Date`-binding bug reach a running server. A single suite against a
-  throwaway database would close it.
-- **No `packages/ai` handler for tools beyond `search_conversations`.** A tool
-  declared privileged with no handler failed a test, so this could not rot silently.
-- **`services/tools/handlers.ts` needs splitting** into one file per tool once there
-  are more than about three.
+  repository, so the transaction in `appendTurn`, the row-value keyset predicate
+  and now the `EXISTS`-based search are covered by the curl exit test and by
+  nothing automated. That is what let the `Date`-binding bug reach a running
+  server. A single suite against a throwaway database would close it, and it is
+  the highest-value testing work left.
+- **`search_conversations` uses `ILIKE`, which cannot use an index.** It scans
+  the calling user's turns. Correct and fast enough at demo size; the fix when
+  it matters is a `tsvector` column with a GIN index — a migration and a change
+  to one repository method.
+- **Tool idempotency deduplicates the AUDIT ROW, not the work.** A retried call
+  re-executes and answers `replayed: true`. Safe because both tools are reads; a
+  mutating privileged tool would have to cache its own result first. Stated on
+  the `ToolHandler` port so it cannot be missed.
+- **Only one privileged tool has a handler.** A tool declared privileged with no
+  handler is a 500 by design, and two tests assert it — one that the gap fails
+  loudly, one that the gap does not currently exist — so this cannot rot silently.
+- **The tool handler map is an object literal in `container.ts`.** Fine at one
+  entry; split it into a `infrastructure/tools/` module once there are more than
+  about three.
+- **`get_current_time` has no device implementation yet.** The server correctly
+  refuses it with 403, but nothing runs it — that is iteration 5/6 work on the
+  phone. Until then the model will call it and get nothing useful.
 
 ## Costs
 

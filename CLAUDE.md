@@ -30,7 +30,9 @@ That has two consequences that shape everything else:
 
 - **Never derive identity or ownership from tool arguments.** Always take the user
   from the authenticated session and scope every query by it. A model can be
-  talked into passing any `userId`; it cannot forge a session.
+  talked into passing any `userId`; it cannot forge a session. Concretely: no
+  contract in `packages/shared` may declare a `userId` field on a request body,
+  and `ToolExecutionContext.userId` is the only identity a tool handler ever sees.
 - **The mobile app must never import `@convo/db` or `drizzle-orm`.** Enforced by a
   Biome rule in `biome.json`.
 - **Dependencies run one way:** `mobile → ai`, `mobile → shared`, `server → ai`,
@@ -89,12 +91,15 @@ src/
 ├─ core/
 │  ├─ domain/entities/          Conversation, Turn. Immutable; a change returns a new instance.
 │  └─ application/
-│     ├─ ports/                 Interfaces the core NEEDS: repositories, authenticator, limiter.
+│     ├─ ports/                 Interfaces the core NEEDS: repositories, authenticator,
+│     │                         limiter, credential minter, tool handlers.
 │     ├─ use-cases/             One class, one verb, one `execute`.
 │     ├─ errors/                ApplicationError — failures with no notion of a status code.
 │     └─ pagination/            Keyset cursor codec.
-├─ infrastructure/              The implementations: Drizzle, Better Auth, in-memory limiter.
-│  └─ di/container.ts           The composition root. The ONLY place `new Drizzle…` appears.
+├─ infrastructure/              The implementations: Drizzle, Better Auth, in-memory
+│  │                            limiter, the OpenAI credential minter.
+│  └─ di/container.ts           The composition root. The ONLY place `new Drizzle…` appears,
+│                               and where tool name → handler is bound.
 ├─ presentation/
 │  ├─ controllers/              defineHandler specs: parse, delegate, map, choose a status.
 │  ├─ middleware/               Guards, composed into named stacks in stacks.ts.
@@ -170,6 +175,33 @@ server: { middleware: authenticatedStack, handlers: { POST: createConversation }
 `requiresAuth: true` on a handler spec both draws the Swagger padlock and enforces
 the 401, so a route wired without its guard fails closed.
 
+## Tools — the device/privileged split
+
+Every tool is declared once in `packages/ai/src/tools/`, with one Zod schema that
+generates the JSON Schema OpenAI is given, validates the arguments that come
+back, and types the handler. `execution` is the security-relevant field:
+
+- **`device`** — runs on the phone (it needs the phone's clock, timezone,
+  sensors). The server **refuses to proxy one, with 403.** Running it anyway
+  would "work", and that is exactly why it is forbidden: it would make the split
+  a naming convention rather than a boundary.
+- **`privileged`** — touches the user's data, so it runs here, as the user from
+  the session. Declared in `@convo/ai`, implemented as a `ToolHandler`, bound to
+  its name in `container.ts`.
+
+`POST /api/tools/:name` fails three different ways on purpose, because they mean
+different things to whoever is debugging:
+
+| Situation | Status | Meaning |
+|---|---|---|
+| Name not in the registry | **404** | The model hallucinated a tool. |
+| Tool is `device` | **403** | Real tool, wrong executor. |
+| `privileged` with no handler | **500** | OUR bug. Not an `ApplicationError`. |
+
+Tool handlers must be safe to **re-run**: the idempotency key deduplicates the
+audit row, not the work. A mutating privileged tool would need to cache its own
+result first.
+
 ## Health endpoints
 
 - `GET /api/health` — liveness. Touches nothing external. Always 200 if the
@@ -201,7 +233,11 @@ uses to open its own WebRTC connection. The key itself never leaves here.
 - Biome for lint and format. `pnpm verify` must pass before pushing.
 - Errors use the envelope in `packages/shared/src/contracts/common.contract.ts`.
   Use cases throw `ApplicationError` (no status codes in the core); `defineHandler`
-  maps it. Presentation code may throw `ApiError` directly.
+  maps it — `not-found`→404, `invalid-input`→400, `conflict`→409,
+  `forbidden`→403, `upstream-failure`→502. Presentation code may throw `ApiError`
+  directly. A failure that is **our** bug (a declared tool with no handler, say)
+  must stay a plain `Error`, so it becomes a 500 with its detail withheld rather
+  than blaming the caller.
 - Log via `~/infrastructure/logging/logger`, never `console`. Transcripts and
   secrets are redacted by key name — do not log them under a different key to work
   around it.
