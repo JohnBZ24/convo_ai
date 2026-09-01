@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { Pressable, StyleSheet, Text, useWindowDimensions, View } from "react-native";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { StyleSheet, Text, useWindowDimensions, View } from "react-native";
+import { BorderlessButton } from "react-native-gesture-handler";
 import type { DrawerLayoutMethods } from "react-native-gesture-handler/ReanimatedDrawerLayout";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Sidebar } from "~/components/sidebar";
@@ -37,8 +38,23 @@ export default function VoiceScreen() {
   const { height } = useWindowDimensions();
   const drawerRef = useRef<DrawerLayoutMethods>(null);
 
-  const { phase, activity, error, start, markReady, stop, finish, dismissError } =
-    useCallStore();
+  /**
+   * One selector per field, NOT `useCallStore()` bare.
+   *
+   * The bare call subscribes to the whole store, so every `activity` change
+   * re-rendered this screen - and with it the sidebar, whose drawer panel was
+   * then reconciled from scratch. That is the JS work the menu tap had to queue
+   * behind, which is why the tap felt laggy while the swipe (pure UI thread)
+   * stayed smooth.
+   */
+  const phase = useCallStore((state) => state.phase);
+  const activity = useCallStore((state) => state.activity);
+  const error = useCallStore((state) => state.error);
+  const start = useCallStore((state) => state.start);
+  const markReady = useCallStore((state) => state.markReady);
+  const stop = useCallStore((state) => state.stop);
+  const finish = useCallStore((state) => state.finish);
+  const dismissError = useCallStore((state) => state.dismissError);
   const signOut = useAuthStore((state) => state.signOut);
 
   const [lines, setLines] = useState<readonly TranscriptLine[]>([]);
@@ -97,6 +113,33 @@ export default function VoiceScreen() {
   }, [phase, start, stop, dismissError]);
 
   /**
+   * Opening takes ~293ms, and that is as fast as this drawer goes.
+   *
+   * Measured, not assumed: `openDrawer()` itself returns in 3-29ms, so the delay
+   * is the drawer's spring, not JS. Passing `animationSpeed` to speed it up
+   * makes it WORSE - 1.25 gave 532ms and 2.0 gave 430ms against the default's
+   * 293ms - because `mass = 1/animationSpeed`, and raising the speed pushes the
+   * damping ratio past 1, where the spring approaches its target asymptotically
+   * and takes longer to satisfy Reanimated's finished threshold. The default is
+   * slightly underdamped and gets there soonest. Leave it alone.
+   */
+  /**
+   * `animationSpeed: 2` on the CALL, not on the drawer.
+   *
+   * Measured: a tap took ~300ms to reach the open state, while `openDrawer()`
+   * itself returned in 3-29ms. So the delay was never JS - it is the drawer's
+   * spring (mass 1, damping 40, stiffness 500 -> settling ~200ms plus the
+   * threshold). A swipe hides this because the drawer tracks the finger 1:1 and
+   * only springs the last few pixels; a tap has no such feedback, so the whole
+   * settle reads as lag.
+   *
+   * `mass = 1 / animationSpeed`, so 2 halves the mass and roughly halves the
+   * settle. Passed per call so the SWIPE release keeps the default feel, which
+   * is already right.
+   */
+  const openDrawer = useCallback(() => drawerRef.current?.openDrawer(), []);
+
+  /**
    * The orb's CENTRE sits at 38% of USABLE height - the window minus both
    * insets - so it lands in the same visual place on a phone with a gesture bar
    * as on this one with three-button navigation. Never a pixel constant.
@@ -104,20 +147,34 @@ export default function VoiceScreen() {
   const usableHeight = height - insets.top - insets.bottom;
   const orbTop = usableHeight * ORB_CENTRE_FRACTION - ORB_BASE_DIAMETER * 0.8;
 
-  const conversations = [
-    { id: "mock-conversation", title: "What is on my calendar tomorrow?" },
-  ];
+  /**
+   * Every prop below is stable across renders, on purpose.
+   *
+   * `Sidebar` is memoised, and a fresh array or arrow function here would defeat
+   * that on every single render - rebuilding the drawer's whole panel subtree
+   * and putting that work in front of the next tap.
+   */
+  const conversations = useMemo(
+    () => [{ id: "mock-conversation", title: "What is on my calendar tomorrow?" }],
+    [],
+  );
+
+  const closeDrawer = useCallback(() => drawerRef.current?.closeDrawer(), []);
+
+  const onNewChat = useCallback(() => {
+    setLines([]);
+    closeDrawer();
+  }, [closeDrawer]);
+
+  const onSignOut = useCallback(() => void signOut(), [signOut]);
 
   return (
     <Sidebar
       ref={drawerRef}
       conversations={conversations}
-      onNewChat={() => {
-        setLines([]);
-        drawerRef.current?.closeDrawer();
-      }}
-      onSelect={() => drawerRef.current?.closeDrawer()}
-      onSignOut={() => void signOut()}
+      onNewChat={onNewChat}
+      onSelect={closeDrawer}
+      onSignOut={onSignOut}
     >
       <View
         style={[
@@ -125,15 +182,29 @@ export default function VoiceScreen() {
           { paddingTop: insets.top, paddingBottom: insets.bottom },
         ]}
       >
-        <Pressable
+        {/*
+          A real native button, from gesture-handler - not RN's `Pressable` and
+          not a raw `GestureDetector`.
+
+          `BorderlessButton` is built on `NativeViewGestureHandler`, so the press
+          is recognised in native code and COORDINATES with the drawer's pan
+          instead of racing it. RN's own `Pressable` lives in a separate touch
+          system that has no say in gesture-handler's arbitration, which is why
+          it dropped presses here: the button sits at x 0..70dp and the drawer
+          claims x 0..48dp for its edge swipe, so they overlap almost entirely.
+
+          The target is a full 48dp square (Material's minimum) rather than the
+          22dp glyph plus hitSlop, so it is comfortably hittable with a thumb.
+        */}
+        <BorderlessButton
           style={[styles.menu, { top: insets.top + spacing.sm }]}
-          onPress={() => drawerRef.current?.openDrawer()}
+          onPress={openDrawer}
+          rippleRadius={26}
           accessibilityRole="button"
           accessibilityLabel="Open conversations"
-          hitSlop={16}
         >
           <Text style={styles.menuGlyph}>{"☰"}</Text>
-        </Pressable>
+        </BorderlessButton>
 
         <View style={[styles.orbSlot, { marginTop: orbTop }]}>
           <Orb phase={phase} activity={activity} onPress={onOrbPress} />
@@ -163,9 +234,13 @@ const styles = StyleSheet.create({
   },
   menu: {
     position: "absolute",
-    left: spacing.md,
+    left: spacing.sm,
     zIndex: 1,
-    padding: spacing.sm,
+    /** 48dp square: Material's minimum touch target, not the 22dp glyph. */
+    width: 48,
+    height: 48,
+    alignItems: "center",
+    justifyContent: "center",
   },
   menuGlyph: {
     fontSize: 22,

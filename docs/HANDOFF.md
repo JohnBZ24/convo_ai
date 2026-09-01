@@ -1,4 +1,4 @@
-# Handoff — 20 Aug 2026 (session 3)
+# Handoff — 1 Sep 2026 (session 4)
 
 Read `CLAUDE.md` first for the architecture rules; this file is state, not design.
 
@@ -62,8 +62,8 @@ even where the code had to be rewritten.
 | 1 | Backend foundation: Clean Architecture, health/ready, generated Swagger | **DONE** `bccbde5` |
 | 2 | Better Auth bearer tokens + conversations CRUD | **DONE** |
 | 3 | `packages/ai` + realtime token route + guarded tools endpoint | **DONE** |
-| 4 | Expo app scaffold + UI shell + FIRST dev build on the Note 8 | Next |
-| 5 | WebRTC audio on a real device | |
+| 4 | Expo app scaffold + UI shell + FIRST dev build on the Note 8 | **DONE** |
+| 5 | WebRTC audio on a real device | Next |
 | 6 | Transcripts, persistence, history screen | |
 | 7 | Hardening + measured latency over USB | |
 
@@ -72,9 +72,11 @@ even where the code had to be rewritten.
 **Read `docs/DESIGN.md` for the design and `CLAUDE.md` for the architecture rules.**
 Both are current. This section is only what a new session cannot infer from them.
 
-Project now lives at **`C:\convo_ai`** (11 chars) - the short path is what unblocks
-the NDK/ninja 250-char limit in iteration 4. Git is initialised and committed.
-**No remote yet** - `gh` is not installed. A private GitHub repo is still wanted.
+Project now lives at **`C:\convo_ai`** (11 chars). The short path was NECESSARY for
+the NDK/ninja 250-char limit but **not sufficient** - see *The Windows path problem*
+under iteration 4; the actual fix was `nodeLinker: hoisted`. Git is initialised, and
+the remote `https://github.com/JohnBZ24/convo_ai.git` is current. `gh` is still not
+installed.
 
 Architecture was adapted from the **`tanstack-start-ca`** Clean Architecture
 boilerplate, kept for reference at `C:\coding	anstack-start-ca`. It uses
@@ -133,6 +135,11 @@ boilerplate, kept for reference at `C:\coding	anstack-start-ca`. It uses
 
 ### Environment limits on this machine
 
+- **`pnpm db:check` / `db:migrate` / `db:generate` / `db:baseline` do NOT load
+  `apps/server/.env`.** They read `DATABASE_URL` from the environment only, so from
+  a bare shell `db:check` fails with *"DATABASE_URL is not set (it lives in
+  apps/server/.env)"* even though the database is fine. Export it first. The comment
+  in `drizzle.config.ts` claiming it is "loaded from there" is wrong.
 - **The Postgres service cannot be stopped without elevation.** To test the
   readiness 503 path end to end, run `net stop postgresql-x64-18` from an
   elevated shell yourself. Otherwise point `DATABASE_URL` at a dead port, which
@@ -282,6 +289,185 @@ below was checked against the LIVE OpenAI API and the running server on
   about the request that was sent then fails to compile with *Tuple type '[]' of
   length '0' has no element at index '0'*. Declare the parameters on the stub
   even when it ignores them.
+
+## What iteration 4 actually built
+
+`apps/mobile`: the Expo app, the UI shell, and a dev build **installed and running
+on the Note 8**. All four exit criteria were checked on the device, not inferred:
+
+- app installs and launches — `BUILD SUCCESSFUL in 5m 24s`, 85MB debug APK
+- sign-in works against the real server — form → `set-auth-token` → redirect
+- mock amplitude visibly pulses the orb — measured 356 / 346 / 344 px across frames
+- the sidebar swipe is smooth
+
+Bundle Mode is confirmed ON DEVICE, which is the whole reason this iteration came
+before the audio work:
+
+```
+LOG [Worklets] Bundle mode initialization: Downloaded the bundle for Worklet Runtimes.
+Android Bundled 199ms node_modules/expo-router/entry.js (1 module)  <- incremental, watcher healthy
+```
+
+Tests: **182** — 119 server, 28 shared, 24 ai, 8 db, **63 mobile**.
+
+### The Bundle Mode six things — CORRECTED
+
+Still six, but two entries were wrong about *why*, and one cost most of a session.
+Read this before touching `metro.config.js`.
+
+1. `babel-preset-expo` with **both** `worklets: false` and `reanimated: false`. Unchanged.
+2. Add the plugin manually with `bundleMode: true` and
+   `importForwarding: { moduleNames: ['remend'] }`. Unchanged.
+3. `worklets.staticFeatureFlags.BUNDLE_MODE_ENABLED: true` — in **`package.json`**.
+4. `expo.autolinking.android.buildFromSource: ["react-native-worklets"]` — also in
+   **`package.json`, NOT `app.json`**. Putting `autolinking` or `install` under the
+   `expo` key of `app.json` fails config-schema validation; `expo-doctor` catches it.
+5. **The two metro patches are GONE and are not needed.**
+   `react-native-worklets@0.10.1` ships no `bundleMode/patches` directory, and
+   installed metro is 0.84.5 / 0.87.0, not the 0.84.4 the old note pinned. The
+   package instead exports `getBundleModeMetroConfig(config)`, labelled *"Use in
+   Expo projects"*, which installs the resolver, the module-id factory and
+   inlineRequires itself. `metro.config.js` is now ~15 lines.
+6. The `.worklets` directory must be **created AND WATCHED**. Creating it is not
+   enough — the earlier note said "watch folder" and it was read as "make the
+   folder". Babel writes each worklet DURING the transform, so the files do not
+   exist when Metro builds its file map, and anything outside a watch root is
+   unknown to it:
+
+   ```
+   Error: Failed to get the SHA-1 for: .../.worklets/16897143079449.js
+   ```
+
+   ```js
+   config.watchFolders = [...(config.watchFolders ?? []), workletsDir];
+   ```
+
+   This is the ONE legitimate `watchFolders` entry. The "do NOT add watchFolders"
+   rule still stands — it is about the monorepo packages, not this.
+
+**`expo export` CANNOT validate Bundle Mode.** It extracted 530 worklets and
+bundled 2389 modules while the device path was completely broken, because a
+one-shot export never uses the file watcher. Only a dev-server bundle to a real
+device proves it. Do not accept an export as evidence again.
+
+### The Windows path problem — SOLVED, and the old fix does not work
+
+Moving to `C:\convo_ai` was necessary but **not sufficient**. The NDK compiles
+worklets from wherever the package physically lives, and `buildFromSource` puts
+that inside pnpm's virtual store. CMake mirrors the SOURCE path into the OBJECT
+path, so the prefix is counted twice:
+
+```
+object dir 191 + object file 198 = 389   vs CMAKE_OBJECT_PATH_MAX 250
+ninja: error: manifest 'build.ninja' still dirty after 100 tries
+```
+
+**Shortening `virtualStoreDir` cannot fix this at any setting.** It is arithmetic:
+`total = 2 x prefix + 137`, `prefix = 66 + <store dir name>`, so a zero-length
+store name still gives 269, and a zero-length name at `C:\c` gives 255. The old
+note recommending `virtualStoreDir` was wrong.
+
+**The fix is `nodeLinker: hoisted`** in `pnpm-workspace.yaml`, putting worklets at
+`node_modules/react-native-worklets` → **229**, under the limit. `pnpm verify`
+passed straight afterwards, so nothing was relying on strict linking.
+
+Switching it is fiddly, and every step fails quietly:
+
+- **pnpm 11 does not read `node-linker` from `.npmrc`.** `pnpm config get
+  node-linker` returns `undefined` and installs silently keep the old layout.
+  Settings live in `pnpm-workspace.yaml` (camelCase `nodeLinker`), like
+  `allowBuilds`. Always confirm with `pnpm config get`.
+- **`pnpm install` in a non-interactive shell HANGS.** Changing the linker makes
+  pnpm prompt to purge `node_modules`; with no stdin it waits forever and prints
+  nothing. Use `--config.confirmModulesPurge=false`.
+- **pnpm will not migrate an existing `node_modules`.** `install`, `install
+  --force`, and deleting `.modules.yaml` all no-op with "Already up to date".
+- **`node_modules` had to go — it was RENAMED, never deleted.** A scan found
+  **2552 reparse points, 10 pointing at real source** (`@convo/mobile` →
+  `apps/mobile`, `@convo/server` → `apps/server`, plus the three packages). A
+  recursive delete following those is precisely the August incident.
+  `Rename-Item` touches one directory entry, cannot traverse into a link target,
+  and is reversible. Source file counts were compared before and after.
+  `node_modules.old/` is gitignored; delete it explicitly when done with it.
+- **Switching the linker invalidates a prebuilt `android/`.** Gradle fails with
+  *"Configuring project ':react-native-enriched-markdown' without an existing
+  directory"*, naming a `.pnpm` path that no longer exists. Re-run
+  `expo prebuild --platform android --clean`. It reads like the hoist failed; it
+  is only stale codegen.
+
+### Traps hit while building it
+
+- **`remend` is a required peer of `react-native-streamdown` and nothing installs
+  it.** The app fails at import without it. It is ESM-only (`import`-condition
+  exports), which is exactly why `importForwarding: { moduleNames: ['remend'] }`
+  exists.
+- **Omitting the `expo-splash-screen` plugin does NOT remove its resource
+  reference.** `styles.xml` points at `@drawable/splashscreen_logo` as soon as the
+  package is autolinked, so dropping the plugin block leaves a dangling reference
+  and resource linking fails. The plugin must be CONFIGURED WITH AN IMAGE.
+  `assets/splash.png` is generated — the dormant orb, so launch does not jump.
+- **`expo run:android --device <serial>` does not accept a serial.** With one
+  device attached, omit the flag.
+- **`npx expo install` exits non-zero under pnpm 11** whenever a package's build
+  script is gated — reporting failure for an install that succeeded.
+- **Expo buffers ALL its output until it exits.** A failing 15-minute build looks
+  like an empty log. Watch Gradle instead:
+  `C:\Users\JBZLB\.gradle\daemon\9.3.1\daemon-*.out.log`. That directory reuses
+  logs across days, so newest-by-mtime can be a stale file — check contents, not
+  the timestamp.
+- **`expo-status-bar` lost `backgroundColor` in SDK 57**, same reason as
+  `edgeToEdgeEnabled`. The root view supplies the colour.
+- **`expo-constants` drags `react-native`'s Flow entry into tests**, which no
+  runner can parse. `process.env.EXPO_PUBLIC_*` is the idiomatic SDK 50+ form and
+  keeps the API client testable in plain Node.
+- **A worklet created by a HOT RELOAD is not in the shipped bundle**: *"[Worklets]
+  Unable to resolve worklet with hash ..."* until Metro restarts. Avoid adding
+  worklets casually; `.runOnJS(true)` sidesteps it.
+- **`dumpsys mCurrentFocus` is unreliable on this Note 8** — it reports a
+  background app while ours is visibly on screen. Classify from screenshots.
+- **`KEYCODE_BACK` exits the app rather than closing the drawer.** Close it by
+  tapping the scrim. Two measurement runs were invalidated by this before it was
+  noticed.
+- **SecureStore survives `pm clear` and an APK reinstall.** A leftover token made
+  the auth guard report `signed-in` and skip the sign-in screen, which looked like
+  a broken redirect. Only a full `adb uninstall` gives a clean auth state.
+
+### The sidebar button — measured, not guessed
+
+The menu button dropped presses and felt laggy while the swipe felt perfect. Three
+fixes were attempted; only the third was the cause, found by logging timestamps
+rather than reasoning:
+
+- **`edgeWidth` was the bug.** The drawer reserves that strip for its edge-swipe
+  pan; the button sits at x 8..56dp, so at 48 they overlapped almost entirely and
+  the pan won the touch. Measured **8 presses / 10 taps at 48, no drops at 20**. A
+  swipe starts at the screen edge anyway, so 20dp costs the gesture nothing.
+- **The ~293ms open is the drawer's spring, not JS.** `openDrawer()` returns in
+  3–29ms. **Do not try to speed it up**: `mass = 1/animationSpeed`, so raising it
+  pushes the damping ratio past 1 and the spring settles SLOWER —
+  `animationSpeed: 1.25` measured 532ms and `2` measured 430ms against the
+  default's 293ms. The default is slightly underdamped and reaches Reanimated's
+  finished threshold soonest. Re-measured to rule out drift.
+- Kept anyway, both genuine improvements: the render fixes (per-field Zustand
+  selectors, `memo` on `Sidebar`, stable props, `useCallback` on
+  `renderNavigationView` — it was rebuilding the whole drawer panel every render)
+  and `BorderlessButton` with a 48dp target, a native gesture-handler button
+  rather than RN's `Pressable`.
+
+### Where iteration 5 starts
+
+The shell is real and on the device; audio is the only missing half.
+
+- `useMockAmplitude(...)` in `src/app/index.tsx` is the ONE line to replace. The
+  shared value in `features/call/amplitude.ts` is already what the orb reads, so
+  the swap is a source change, not a rewrite.
+- The call machine in `features/call/call-store.ts` already has the phases; the
+  `setTimeout`s in `index.tsx` that fake `connecting` and `ending` become WebRTC
+  lifecycle events.
+- `SCRIPTED_LINES` in `index.tsx` is the placeholder transcript — delete it.
+- `POST /api/realtime/token` is live and returns `callsUrl`; the device POSTs its
+  SDP offer there. Mint TTL is 60s but this machine's clock is ~25s fast, so the
+  credential looks like ~34s. Fix the machine's time sync before debugging WebRTC.
 
 ## The API as built
 

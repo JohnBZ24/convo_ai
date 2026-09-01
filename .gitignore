@@ -1,6 +1,10 @@
 # dependencies
 node_modules/
 .pnpm-store/
+# left behind when switching pnpm's node-linker: node_modules is RENAMED
+# aside rather than deleted, because it holds symlinks that point out at
+# real source. Safe to remove once a build has passed.
+node_modules.old/
 
 # build output
 dist/

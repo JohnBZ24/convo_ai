@@ -214,10 +214,13 @@ result first.
 ```bash
 pnpm install
 pnpm server                      # dev server on :3000
+pnpm mobile                      # Metro for the Expo app
+pnpm mobile:android              # build + install the dev build on a device
 pnpm verify                      # lint + typecheck + test — run before pushing
 pnpm format                      # apply Biome fixes
 pnpm db:generate && pnpm db:migrate
-pnpm db:check                    # connectivity + table list (drizzle-kit prints nothing on failure)
+pnpm db:check                    # connectivity + table list. NEEDS DATABASE_URL exported:
+                                 # the db scripts do NOT read apps/server/.env
 pnpm db:baseline                 # mark the journal as applied WITHOUT running it — see the script
 ```
 

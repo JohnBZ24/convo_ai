@@ -29,4 +29,23 @@ const workletsDir = path.join(
 );
 fs.mkdirSync(workletsDir, { recursive: true });
 
+/**
+ * WATCHING it is the other half, and the half that is easy to miss.
+ *
+ * Babel writes these files DURING the transform, so they do not exist when Metro
+ * builds its file map. Anything outside a watch root is unknown to that map, and
+ * the dev server fails the moment it tries to hash one:
+ *
+ *   Error: Failed to get the SHA-1 for: .../.worklets/16897143079449.js
+ *
+ * `expo export` does NOT show this - a one-shot bundle never needs the watcher -
+ * so Bundle Mode can look completely working right up until the app is run on a
+ * device against a dev server.
+ *
+ * This is the ONLY watchFolders entry that belongs here. Do not add the monorepo
+ * packages: Expo has configured Metro for pnpm workspaces since SDK 52, and its
+ * own migration note is to DELETE those.
+ */
+config.watchFolders = [...(config.watchFolders ?? []), workletsDir];
+
 module.exports = getBundleModeMetroConfig(config);

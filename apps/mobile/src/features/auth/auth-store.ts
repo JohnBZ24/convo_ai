@@ -55,7 +55,20 @@ export const useAuthStore = create<AuthState>((set, get) => ({
    * not on a voice screen whose every request 401s.
    */
   restore: async () => {
-    const stored = await SecureStore.getItemAsync(TOKEN_KEY);
+    /**
+     * Guarded, because a throw here used to leave `status` on "unknown"
+     * FOREVER - and "unknown" is the one value the redirect ignores, so the app
+     * silently stayed on the voice screen instead of going to sign-in. A
+     * keystore that will not open is a signed-out user, not a hung app.
+     */
+    let stored: string | null = null;
+    try {
+      stored = await SecureStore.getItemAsync(TOKEN_KEY);
+    } catch {
+      set({ status: "signed-out", token: null, user: null });
+      return;
+    }
+
     if (!stored) {
       set({ status: "signed-out" });
       return;

@@ -5,7 +5,7 @@ import {
   QueryClientProvider,
 } from "@tanstack/react-query";
 import * as Network from "expo-network";
-import { Stack, useRouter, useSegments } from "expo-router";
+import { Stack, useRootNavigationState, useRouter, useSegments } from "expo-router";
 import { StatusBar } from "expo-status-bar";
 import { useEffect, useRef, useState } from "react";
 import { AppState, type AppStateStatus } from "react-native";
@@ -53,22 +53,38 @@ function useQueryPlatformBridges() {
 /**
  * Sends the user to the right screen once the stored token has been checked.
  *
- * Guarded on `status !== "unknown"`: redirecting before `restore` finishes
- * would flash the sign-in screen at a user who is already signed in.
+ * Two guards, and BOTH are load-bearing:
+ *
+ * - `status !== "unknown"` - redirecting before `restore` finishes would flash
+ *   the sign-in screen at a user who is already signed in.
+ * - the navigator must be mounted. This hook runs inside the ROOT layout, which
+ *   renders before `<Stack>` has a navigation tree, and a `router.replace` from
+ *   there is silently DROPPED - no error, no navigation. The app then sits on
+ *   the voice screen with no session, which reads as a broken guard rather than
+ *   a timing bug.
  */
 function useAuthRedirect() {
   const status = useAuthStore((state) => state.status);
   const segments = useSegments();
   const router = useRouter();
+  const navigationState = useRootNavigationState();
 
   useEffect(() => {
     if (status === "unknown") return;
+    if (!navigationState?.key) return;
 
     const onSignIn = segments[0] === "sign-in";
 
     if (status === "signed-out" && !onSignIn) router.replace("/sign-in");
     if (status === "signed-in" && onSignIn) router.replace("/");
-  }, [status, segments, router]);
+    /**
+     * `navigationState?.key` MUST be in this list. It is read above as a guard,
+     * and on a cold start it becomes available AFTER `restore` has already
+     * settled `status` - so without it the effect never re-runs once the
+     * navigator is ready, and the redirect is simply never issued. The symptom
+     * is an app that sits on the voice screen with no session and no error.
+     */
+  }, [status, segments, router, navigationState?.key]);
 }
 
 export default function RootLayout() {
