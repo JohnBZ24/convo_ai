@@ -6,9 +6,34 @@ packages:
 # fetches its platform-specific binary; Vite and Vitest do not run without it.
 allowBuilds:
   esbuild: true
+  # false on purpose. Its postinstall downloads tree-sitter grammars and KaTeX
+  # for code highlighting and maths - neither of which a spoken transcript has.
+  # The library renders fine without them.
+  react-native-enriched-markdown: false
 
 # pnpm 11 refuses packages published within its minimum-release-age window as a
 # supply-chain guard. vite@8.2.2 is newer than that window; pnpm recorded the
 # exception itself. Revisit when a settled 8.x is available.
 minimumReleaseAgeExclude:
   - vite@8.2.2
+
+# Hoisted, not pnpm's default virtual store, and ONLY because of the Android NDK.
+#
+# Bundle Mode needs `buildFromSource: ["react-native-worklets"]`, which makes
+# Gradle compile worklets' C++ from wherever the package physically lives. In the
+# virtual store that is
+#   node_modules/.pnpm/react-native-worklets@0.10._2e89...52b54/node_modules/react-native-worklets
+# and CMake derives the OBJECT file's path from the SOURCE path, so those 126
+# characters are counted twice: 389 against CMake's 250 limit, and ninja dies with
+#   ninja: error: manifest 'build.ninja' still dirty after 100 tries
+# Hoisting puts it at node_modules/react-native-worklets - 229 characters, under
+# the limit. Shortening virtualStoreDir does NOT get there (337), which is what
+# an earlier version of docs/HANDOFF.md suggested.
+#
+# The cost: an undeclared dependency now resolves silently instead of failing.
+# `pnpm verify` is what catches that - run it after touching dependencies.
+#
+# NOTE: this belongs HERE, not in .npmrc. pnpm 11 does not read node-linker from
+# .npmrc at all; `pnpm config get node-linker` returns undefined and the install
+# silently keeps the old layout.
+nodeLinker: hoisted

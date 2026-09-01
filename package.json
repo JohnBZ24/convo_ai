@@ -8,6 +8,8 @@
   },
   "scripts": {
     "server": "pnpm --filter @convo/server dev",
+    "mobile": "pnpm --filter @convo/mobile start",
+    "mobile:android": "pnpm --filter @convo/mobile android",
     "verify": "turbo run lint typecheck --concurrency=2 && turbo run test --concurrency=1",
     "lint": "turbo run lint --concurrency=2",
     "typecheck": "turbo run typecheck --concurrency=2",
