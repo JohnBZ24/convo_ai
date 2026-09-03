@@ -11,7 +11,8 @@
       "package": "com.abiroot.convoai",
       "adaptiveIcon": {
         "backgroundColor": "#202123"
-      }
+      },
+      "blockedPermissions": ["android.permission.CAMERA"]
     },
     "plugins": [
       "expo-router",
@@ -24,7 +25,15 @@
           "backgroundColor": "#202123",
           "resizeMode": "contain"
         }
-      ]
+      ],
+      [
+        "@config-plugins/react-native-webrtc",
+        {
+          "microphonePermission": "Convo needs the microphone to hear you."
+        }
+      ],
+      "./plugins/with-cleartext-traffic",
+      "./plugins/with-device-abi"
     ],
     "experiments": {
       "typedRoutes": true

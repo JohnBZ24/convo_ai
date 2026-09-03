@@ -1,8 +1,11 @@
 # Convo AI
 
-A push-to-talk conversational AI mobile app. The user taps a mic button to open a
-voice session, talks with the model, taps again to end it, and the conversation is
-saved as a chat.
+A hands-free conversational AI mobile app. The user taps the orb to open a voice
+session, talks with the model — server VAD decides whose turn it is, and the user
+can interrupt — taps again to end it, and the conversation is saved as a chat.
+
+It is **not** push-to-talk: the microphone is open for the whole session, and
+nothing is held down.
 
 > This file was emptied by accident in commit `bccbde5` and restored in iteration
 > 2, updated to match the Clean Architecture that iteration 1 actually built. If
@@ -74,7 +77,7 @@ Rules that follow from that:
 ## Layout
 
 ```
-apps/mobile     Expo + Expo Router. Screens, call state machine, audio pipeline.
+apps/mobile     Expo + Expo Router. Screens, call state machine, WebRTC audio.
 apps/server     TanStack Start. Token minting, tools, persistence. Not the audio path.
 packages/ai     Tool definitions, prompts, model ids. Declares behavior, never performs it.
 packages/db     Drizzle schema, migrations, client. Imported only by the server.
@@ -162,9 +165,31 @@ clickable.
 ## Auth
 
 Better Auth with email + password, `minPasswordLength: 12`, and the **bearer**
-plugin — the app has no cookie jar. Config in
-`infrastructure/auth/auth.ts`; the token arrives in the `set-auth-token` response
-header (the body's `token` differs but also authenticates).
+plugin. Config in `infrastructure/auth/auth.ts`; the token arrives in the
+`set-auth-token` response header (the body's `token` differs but also
+authenticates — the header is the signed form, and the plugin signs a bare token
+itself before verifying, which is why both work).
+
+It is a **session token, not a JWT**: two dot-separated parts, `<token>.<HMAC>`,
+where the first half is a row in the `session` table. So it is revocable by
+deleting that row, and every authenticated request costs one lookup.
+
+**The app DOES have a cookie jar, and that cost a session to learn.** The
+comment in `auth.ts` said it did not. On Android, React Native's fetch runs on
+OkHttp, which keeps a native jar and replays the `better-auth.session_token`
+cookie Better Auth set at sign-in — while React Native sends no `Origin`. Better
+Auth runs its CSRF origin check only when a cookie is present, so that pairing
+is a 403 on **every auth POST**: sign-in, sign-up and sign-out alike. GETs
+return before the check, so `get-session` keeps working and the app looks half
+alive. curl reproduces neither header, which is why every server-side probe
+passed and it only ever appeared on a phone.
+
+`infrastructure/auth/native-cookie.ts` drops that cookie before Better Auth sees
+it — but only when nothing announces a browser (`Origin`, `Referer`,
+`Sec-Fetch-Site`). Removing the credential removes the CSRF surface; a browser
+keeps its cookie and keeps the protection. **Do not "fix" this with
+`advanced.disableCSRFCheck`** — Better Auth's own docs call it a security risk,
+and it would switch the check off for browsers too.
 
 Guards live in `presentation/middleware`. A route gets them by naming a stack:
 
@@ -202,6 +227,54 @@ Tool handlers must be safe to **re-run**: the idempotency key deduplicates the
 audit row, not the work. A mutating privileged tool would need to cache its own
 result first.
 
+## The device side of a call
+
+Everything under `apps/mobile/src/features/call/`. The split there is the same
+instinct as the server's ports, for the same reason plus one practical one.
+
+| File | Imports React Native? | Tested |
+|---|---|---|
+| `call-store.ts` | no (zustand only) | ✅ the phase machine |
+| `realtime-events.ts` | no | ✅ wire events → domain events |
+| `transcript-assembler.ts` | no | ✅ a pure reducer |
+| `realtime-session.ts` | no | ✅ the connect ORDER |
+| `device-tools.ts` | no | ✅ device vs proxied routing |
+| `webrtc-adapter.ts` | **yes** — `react-native-webrtc` | — |
+| `audio-route.ts` | **yes** — `react-native-incall-manager` | — |
+| `use-call-session.ts` | **yes** — the React wiring | — |
+
+**Nothing in a tested file may import `react-native`.** It drags React Native's
+Flow-typed entry point in, which no test runner can parse — the same trap that
+keeps `expo-constants` out of `lib/api/client.ts`. The two adapters exist so the
+`Minimal*` interfaces in `realtime-session.ts` are the only shape the logic knows.
+
+Three things about the call that are easy to get wrong:
+
+- **The order in `open()` is load-bearing.** The credential lives ~60 seconds, so
+  the permission dialog, the microphone and ICE gathering all happen BEFORE the
+  mint. `realtime-session.test.ts` asserts that order literally.
+- **The offer that goes on the wire is `peer.localDescription`**, read after ICE
+  gathering completes (2s ceiling) — not what `createOffer` returned.
+  `setLocalDescription` resolves before candidates exist, and an offer without
+  them negotiates and then never carries audio.
+- **`InCallManager.start` runs before `getUserMedia`.** It puts Android in
+  `MODE_IN_COMMUNICATION`, and the mode the mic is OPENED in decides whether
+  hardware echo cancellation is engaged. Get this backwards and the model hears
+  itself through the loudspeaker and interrupts itself.
+- **`setForceSpeakerphoneOn(true)` does NOT route the audio here.** With
+  `auto: false` it silently does nothing, and the call comes out of the
+  earpiece. `auto` does not only control the proximity sensor: it also sets
+  `automatic`, and `updateAudioRoute()` returns immediately when that is false —
+  which leaves `audioDevices` empty after `start()` cleared it, so
+  `selectAudioDevice(SPEAKER_PHONE)` bails on its own containment check. The
+  line that actually routes is **`setSpeakerphoneOn(true)`**, which calls
+  `AudioManager` directly with no device-set check. Keep both, in that order.
+
+**The device sends no `session.update`.** `buildClientSecretRequest()` binds the
+instructions, tools and VAD config to the credential at mint time. Pushing them
+again from the phone would make the system prompt client-rewritable, which is the
+one boundary this whole design exists to hold.
+
 ## Health endpoints
 
 - `GET /api/health` — liveness. Touches nothing external. Always 200 if the
@@ -221,7 +294,8 @@ pnpm format                      # apply Biome fixes
 pnpm db:generate && pnpm db:migrate
 pnpm db:check                    # connectivity + table list. NEEDS DATABASE_URL exported:
                                  # the db scripts do NOT read apps/server/.env
-pnpm db:baseline                 # mark the journal as applied WITHOUT running it — see the script
+pnpm --filter @convo/db db:baseline   # mark the journal as applied WITHOUT running it.
+                                 # NOT `pnpm db:baseline` - there is no root script for it.
 ```
 
 Environment lives in `apps/server/.env` (see `.env.example`). Vite loads it

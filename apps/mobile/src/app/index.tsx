@@ -1,14 +1,18 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useMemo, useRef } from "react";
 import { StyleSheet, Text, useWindowDimensions, View } from "react-native";
 import { BorderlessButton } from "react-native-gesture-handler";
 import type { DrawerLayoutMethods } from "react-native-gesture-handler/ReanimatedDrawerLayout";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Sidebar } from "~/components/sidebar";
 import { useAuthStore } from "~/features/auth/auth-store";
-import { useMockAmplitude } from "~/features/call/amplitude";
-import { useCallStore } from "~/features/call/call-store";
+import {
+  type CallActivity,
+  type CallPhase,
+  useCallStore,
+} from "~/features/call/call-store";
 import { Orb } from "~/features/call/orb";
-import { Transcript, type TranscriptLine } from "~/features/call/transcript";
+import { Transcript } from "~/features/call/transcript";
+import { useCallSession } from "~/features/call/use-call-session";
 import {
   colors,
   ORB_BASE_DIAMETER,
@@ -16,22 +20,6 @@ import {
   spacing,
   typography,
 } from "~/theme/tokens";
-
-/**
- * Iteration 4 has no audio, so a tap runs a scripted exchange instead. It exists
- * to prove the shell - the state machine, the orb, the list - on the device
- * before WebRTC is in the picture.
- */
-const SCRIPTED_LINES: readonly TranscriptLine[] = [
-  { id: "1", role: "user", text: "What is on my calendar tomorrow?" },
-  {
-    id: "2",
-    role: "assistant",
-    text: "You have two things: a design review at ten, and dinner at eight.",
-  },
-  { id: "3", role: "user", text: "Move the design review to the afternoon." },
-  { id: "4", role: "assistant", text: "Done - it is at three now. Anything else?" },
-];
 
 export default function VoiceScreen() {
   const insets = useSafeAreaInsets();
@@ -51,53 +39,21 @@ export default function VoiceScreen() {
   const activity = useCallStore((state) => state.activity);
   const error = useCallStore((state) => state.error);
   const start = useCallStore((state) => state.start);
-  const markReady = useCallStore((state) => state.markReady);
   const stop = useCallStore((state) => state.stop);
-  const finish = useCallStore((state) => state.finish);
   const dismissError = useCallStore((state) => state.dismissError);
   const signOut = useAuthStore((state) => state.signOut);
 
-  const [lines, setLines] = useState<readonly TranscriptLine[]>([]);
-
   /**
-   * The mock amplitude source. Iteration 5 deletes this line and starts the
-   * real microphone instead - everything downstream reads the same shared
-   * value, so nothing else on this screen changes.
+   * The real thing: this opens the WebRTC connection when the machine reaches
+   * `connecting`, tears it down at `ending`, writes the live microphone and
+   * assistant levels into the shared amplitude value, and returns the
+   * transcript assembled from the data channel.
+   *
+   * It replaced two `setTimeout`s and four hard-coded lines. Everything else on
+   * this screen is unchanged, which was the point of keeping the state machine
+   * separate from whatever produces its transitions.
    */
-  useMockAmplitude(phase === "live" && activity !== "thinking");
-
-  /** Fake the connect and teardown delays the real transport will have. */
-  useEffect(() => {
-    if (phase === "connecting") {
-      const timer = setTimeout(() => markReady("mock-conversation"), 700);
-      return () => clearTimeout(timer);
-    }
-
-    if (phase === "ending") {
-      const timer = setTimeout(finish, 400);
-      return () => clearTimeout(timer);
-    }
-
-    return undefined;
-  }, [phase, markReady, finish]);
-
-  /** Reveal the scripted transcript a line at a time while live. */
-  useEffect(() => {
-    if (phase !== "live") return undefined;
-
-    let index = 0;
-    const timer = setInterval(() => {
-      const next = SCRIPTED_LINES[index];
-      if (!next) {
-        clearInterval(timer);
-        return;
-      }
-      setLines((current) => [...current, next]);
-      index += 1;
-    }, 1800);
-
-    return () => clearInterval(timer);
-  }, [phase]);
+  const lines = useCallSession();
 
   const onOrbPress = useCallback(() => {
     if (phase === "error") {
@@ -108,7 +64,12 @@ export default function VoiceScreen() {
       stop();
       return;
     }
-    setLines([]);
+    /**
+     * Ignored mid-connect and mid-teardown. `start` guards itself, but landing
+     * here during `connecting` would still be a tap that appears to do nothing
+     * while a peer connection is being negotiated behind it.
+     */
+    if (phase === "connecting" || phase === "ending") return;
     start();
   }, [phase, start, stop, dismissError]);
 
@@ -154,17 +115,16 @@ export default function VoiceScreen() {
    * that on every single render - rebuilding the drawer's whole panel subtree
    * and putting that work in front of the next tap.
    */
-  const conversations = useMemo(
-    () => [{ id: "mock-conversation", title: "What is on my calendar tomorrow?" }],
-    [],
-  );
+  /**
+   * Still empty. Real history comes from `GET /api/conversations` in iteration
+   * 6; a hard-coded row here would only be a second thing to delete then.
+   */
+  const conversations = useMemo(() => [], []);
 
   const closeDrawer = useCallback(() => drawerRef.current?.closeDrawer(), []);
 
-  const onNewChat = useCallback(() => {
-    setLines([]);
-    closeDrawer();
-  }, [closeDrawer]);
+  /** The transcript belongs to the session now, and clears when one opens. */
+  const onNewChat = useCallback(() => closeDrawer(), [closeDrawer]);
 
   const onSignOut = useCallback(() => void signOut(), [signOut]);
 
@@ -208,7 +168,7 @@ export default function VoiceScreen() {
 
         <View style={[styles.orbSlot, { marginTop: orbTop }]}>
           <Orb phase={phase} activity={activity} onPress={onOrbPress} />
-          <Text style={styles.status}>{statusLabel(phase, error)}</Text>
+          <Text style={styles.status}>{statusLabel(phase, activity, error)}</Text>
         </View>
 
         <View style={styles.transcript}>
@@ -219,11 +179,26 @@ export default function VoiceScreen() {
   );
 }
 
-function statusLabel(phase: string, error: string | null): string {
+/**
+ * `activity` is real now: it is driven by server VAD and the model's own
+ * response events, so the label finally tells the truth about which of the two
+ * is talking rather than always claiming to be listening.
+ */
+function statusLabel(
+  phase: CallPhase,
+  activity: CallActivity,
+  error: string | null,
+): string {
   if (phase === "error") return error ?? "Something went wrong";
   if (phase === "connecting") return "Connecting";
   if (phase === "ending") return "Ending";
-  if (phase === "live") return "Listening";
+
+  if (phase === "live") {
+    if (activity === "thinking") return "Thinking";
+    if (activity === "speaking") return "Speaking";
+    return "Listening";
+  }
+
   return "Tap to talk";
 }
 

@@ -103,3 +103,44 @@ describe("apiRequest error shapes", () => {
     expect(seen).toBe("header-token");
   });
 });
+
+describe("apiRequest network failures", () => {
+  /**
+   * The launch path awaits `get-session` before it can pick a screen, and RN's
+   * fetch has no timeout - so an unreachable laptop used to leave the app on
+   * its splash indefinitely, which reads as a broken app rather than a broken
+   * network.
+   */
+  it("gives up rather than hanging when the server never answers", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        (_url: string, init: RequestInit) =>
+          new Promise<Response>((_resolve, reject) => {
+            init.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+          }),
+      ),
+    );
+
+    const error = await failureOf(
+      apiRequest("/api/auth/get-session", { timeoutMs: 20 }),
+    );
+
+    expect(error.code).toBe("TIMEOUT");
+    expect(error.status).toBe(0);
+  });
+
+  it("reports an unreachable server as NETWORK, not as a bad response", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        throw new TypeError("Network request failed");
+      }),
+    );
+
+    const error = await failureOf(apiRequest("/api/health"));
+
+    expect(error.code).toBe("NETWORK");
+    expect(error.message).toBe("Could not reach the server");
+  });
+});

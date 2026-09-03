@@ -65,28 +65,72 @@ async function toError(response: Response): Promise<ApiRequestError> {
   );
 }
 
+/**
+ * Long enough for a cold server route to compile, short enough that a laptop
+ * that is asleep, off the network or on a changed IP fails VISIBLY instead of
+ * leaving the app on its splash screen forever.
+ *
+ * React Native's fetch has no timeout of its own, and the launch path awaits
+ * `GET /api/auth/get-session` before it can decide which screen to show - so
+ * without this, "the server is unreachable" and "the app is broken" look
+ * identical to the user.
+ */
+export const REQUEST_TIMEOUT_MS = 10_000;
+
 export interface RequestOptions {
   method?: "GET" | "POST" | "PATCH";
   body?: unknown;
   token?: string | null;
   /** Better Auth answers with the bearer token in a RESPONSE header, not the body. */
   onAuthToken?: (token: string) => void;
+  /** Override the default. A realtime mint is the one call worth waiting on. */
+  timeoutMs?: number;
 }
 
 export async function apiRequest<T>(
   path: string,
   options: RequestOptions = {},
 ): Promise<T> {
-  const { method = "GET", body, token, onAuthToken } = options;
+  const {
+    method = "GET",
+    body,
+    token,
+    onAuthToken,
+    timeoutMs = REQUEST_TIMEOUT_MS,
+  } = options;
 
-  const response = await fetch(`${API_BASE_URL}${path}`, {
-    method,
-    headers: {
-      ...(body === undefined ? {} : { "content-type": "application/json" }),
-      ...(token ? { authorization: `Bearer ${token}` } : {}),
-    },
-    body: body === undefined ? undefined : JSON.stringify(body),
-  });
+  /**
+   * `AbortController` rather than `AbortSignal.timeout`: the static is not on
+   * every Hermes build this app has to run on, and a missing static would throw
+   * inside the request path rather than failing a feature check.
+   */
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE_URL}${path}`, {
+      method,
+      headers: {
+        ...(body === undefined ? {} : { "content-type": "application/json" }),
+        ...(token ? { authorization: `Bearer ${token}` } : {}),
+      },
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal: controller.signal,
+    });
+  } catch {
+    // An abort and a dead network arrive here the same way; say which it was.
+    if (controller.signal.aborted) {
+      throw new ApiRequestError(
+        `The server did not answer within ${Math.round(timeoutMs / 1000)}s`,
+        0,
+        "TIMEOUT",
+      );
+    }
+    throw new ApiRequestError("Could not reach the server", 0, "NETWORK");
+  } finally {
+    clearTimeout(timer);
+  }
 
   const headerToken = response.headers.get("set-auth-token");
   if (headerToken && onAuthToken) onAuthToken(headerToken);

@@ -3,12 +3,13 @@ import { memo, useCallback, useMemo } from "react";
 import { StyleSheet, View } from "react-native";
 import { StreamdownText } from "react-native-streamdown";
 import { colors, spacing, typography } from "~/theme/tokens";
+import type { TranscriptLine } from "./transcript-assembler";
 
-export interface TranscriptLine {
-  id: string;
-  role: "user" | "assistant";
-  text: string;
-}
+/**
+ * Re-exported so callers still say `from "~/features/call/transcript"`. The
+ * shape itself belongs with the reducer that builds it, not with the view.
+ */
+export type { TranscriptLine };
 
 interface TranscriptProps {
   lines: readonly TranscriptLine[];

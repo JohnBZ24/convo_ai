@@ -1,7 +1,9 @@
 # Convo AI — Design & Build Plan
 
-**Status:** design agreed 20 Aug 2026. **Iterations 0–3 are built** (backend
-complete); iteration 4 — the Expo app and the first dev build on the Note 8 — is next.
+**Status:** design agreed 20 Aug 2026. **Iterations 0–5 are built** — the backend, the
+Expo app, and real WebRTC audio on the Note 8 (iteration 5's exit test needs a human
+voice and is still open; see `HANDOFF.md`). Iteration 6 (transcript persistence and
+history) is next.
 **Read order:** `CLAUDE.md` (rules) → this file (design) → `HANDOFF.md` (verified facts, gotchas).
 
 > Two parts of this file describe a design that iteration 1 deliberately
@@ -77,7 +79,7 @@ Two consequences drive the security design:
  4. app   →  POST /api/realtime/token            → { clientSecret, expiresAt, model, voice }
  5. app   →  getUserMedia → RTCPeerConnection → createOffer
  6. app   →  POST OpenAI /v1/realtime/calls (SDP + Bearer clientSecret) → answer SDP
- 7.          data channel `oai-events` opens → session.update (instructions, tools, VAD)
+ 7.          data channel `oai-events` opens → the call is live. NO session.update.
  8.          ══ audio flows device ↔ OpenAI, transcript deltas on the data channel ══
  9. app   →  POST /api/conversations/:id/turns   (per completed turn, seq monotonic)
 10. model →  tool call → runs on device, or proxies to POST /api/tools/:name
@@ -87,6 +89,21 @@ Two consequences drive the security design:
 
 Steps 4 and 6 are the only places the credential is used, and it is dead 60
 seconds after minting.
+
+**Step 7 used to say the device pushes `session.update` with the instructions,
+tools and VAD config. It does not, and must not.** `buildClientSecretRequest()`
+already binds all of that to the credential at mint time, and `session.test.ts`
+pins the exact body. Sending it again from the phone would be redundant at best,
+and at worst would make the system prompt and the tool set rewritable by the
+client — dissolving the boundary the rest of this design is built around. The
+server owns session configuration; the device owns routing and the transcript.
+
+**Step 5 has one more step than it looks.** `setLocalDescription` resolves before
+ICE candidates are gathered, so the offer POSTed at step 6 must be
+`peer.localDescription`, taken after gathering completes (with a ~2s ceiling), and
+not the object `createOffer` returned. In a browser this does not matter. In React
+Native an offer with no candidates negotiates happily and then never connects,
+which presents as a call that goes live and stays silent.
 
 ---
 
@@ -470,12 +487,19 @@ real server · mock amplitude visibly pulses the orb · sidebar swipe is smooth.
 
 ---
 
-### Iteration 5 — WebRTC audio on the device
+### Iteration 5 — WebRTC audio on the device — BUILT
 
 `react-native-webrtc` via config plugin, `RECORD_AUDIO` permission, audio focus and
-speaker routing. Mint → `getUserMedia` → peer connection → offer → OpenAI → answer
-→ data channel → `session.update`. Real mic amplitude replaces the mock **by
-writing the same shared value**.
+speaker routing (`react-native-incall-manager`). Mint → `getUserMedia` → peer
+connection → offer → OpenAI → answer → data channel. Real mic and assistant
+amplitude replace the mock **by writing the same shared value**, read from
+`getStats()`.
+
+Two things landed that the original scope did not name, because the data channel
+had to be parsed to debug the handshake anyway and rendering what it says is nearly
+free once it is: the **live transcript** under the orb, and **tool routing** —
+`get_current_time` on the phone, `search_conversations` proxied to
+`POST /api/tools/:name`. Turn persistence stayed in iteration 6.
 
 **Exit test:** tap the orb, say "hello", hear the reply through the loudspeaker, and
 confirm the model does **not** interrupt itself — that is WebRTC's echo cancellation
