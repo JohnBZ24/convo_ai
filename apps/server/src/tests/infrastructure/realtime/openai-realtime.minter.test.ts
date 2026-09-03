@@ -95,6 +95,7 @@ describe("the request it sends", () => {
     expect(body.session.tools.map((tool: { name: string }) => tool.name)).toEqual([
       "get_current_time",
       "search_conversations",
+      "web_search",
     ]);
   });
 

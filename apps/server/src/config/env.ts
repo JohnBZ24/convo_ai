@@ -7,6 +7,7 @@ import {
   REALTIME_VOICES,
 } from "@convo/ai";
 import { z } from "zod";
+import { EXA_SEARCH_TYPES } from "~/infrastructure/search/exa-search-type";
 
 /**
  * A blank line in a .env file (`FOO=`) arrives as an EMPTY STRING, not
@@ -86,6 +87,38 @@ const envSchema = z.object({
    */
   OPENAI_REQUEST_TIMEOUT_MS: withDefault(
     z.coerce.number().int().min(1000).max(60_000).default(10_000),
+  ),
+
+  /**
+   * Server-only, and for the same reason as the OpenAI key: a search key on the
+   * device is a billable credential inside an APK. The phone gets proxied
+   * results and never this.
+   */
+  EXA_API_KEY: z.string().min(1, "EXA_API_KEY is required"),
+
+  EXA_BASE_URL: withDefault(z.url().default("https://api.exa.ai")),
+
+  /**
+   * The biggest lever on how responsive the app feels. Defaults to `fast`:
+   * measured at ~660ms on a novel query against ~1230ms for `auto`, with the
+   * same freshness on the queries that matter. `instant` is quicker still and
+   * served a five-week-old weather page, so it is not an option here. Validated
+   * against the enumerated set so a typo fails at boot rather than as a 400
+   * from Exa mid-conversation.
+   */
+  EXA_SEARCH_TYPE: withDefault(z.enum(EXA_SEARCH_TYPES).default("fast")),
+
+  /**
+   * Much shorter than the OpenAI timeout, on purpose. A hung mint leaves a user
+   * staring at a spinning orb; a hung search leaves them listening to nothing
+   * mid-sentence, right after the model promised to look something up. That is
+   * a worse silence and deserves to be given up on sooner.
+   *
+   * 5000 against an observed max of 1311ms on `fast` - about 4x headroom, and
+   * half the dead air the old 8000 allowed.
+   */
+  EXA_REQUEST_TIMEOUT_MS: withDefault(
+    z.coerce.number().int().min(1000).max(30_000).default(5000),
   ),
 
   BETTER_AUTH_SECRET: z.string().min(1, "BETTER_AUTH_SECRET is required"),

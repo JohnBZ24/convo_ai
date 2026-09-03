@@ -109,6 +109,7 @@ const APPLICATION_ERROR_STATUS: Record<
   "invalid-input": (error) => ApiError.badRequest(error.message, error.details),
   conflict: (error) => ApiError.conflict(error.message, error.details),
   forbidden: (error) => ApiError.forbidden(error.message),
+  "rate-limited": (error) => ApiError.rateLimited(error.message, error.details),
   /**
    * 502, not 500. The distinction is the whole reason the kind exists: a 500
    * says "our bug, look in this codebase", a 502 says "the service behind us

@@ -8,6 +8,7 @@ import {
 } from "./registry";
 import { searchConversationsTool } from "./search-conversations.tool";
 import { toParameterSchema } from "./tool-definition";
+import { webSearchTool } from "./web-search.tool";
 
 /**
  * The registry is the security boundary's source of truth: the server decides
@@ -33,10 +34,17 @@ describe("the registry", () => {
    * tool - the server has no better clock than the phone, and proxying it would
    * establish "the model asked, so we ran it" as an acceptable pattern.
    */
-  it("keeps get_current_time on the device and search_conversations privileged", () => {
+  it("keeps get_current_time on the device and the other two privileged", () => {
     expect(getCurrentTimeTool.execution).toBe("device");
     expect(searchConversationsTool.execution).toBe("privileged");
-    expect(privilegedToolNames()).toEqual(["search_conversations"]);
+    /**
+     * `web_search` is privileged for a different reason than
+     * `search_conversations`: the web is nobody's private data, but the search
+     * key is OURS. Running it on the phone would put a billable credential in
+     * an APK, which is the same argument that keeps OPENAI_API_KEY server-side.
+     */
+    expect(webSearchTool.execution).toBe("privileged");
+    expect(privilegedToolNames()).toEqual(["search_conversations", "web_search"]);
   });
 
   it("never declares a userId parameter on any tool", () => {
@@ -84,6 +92,7 @@ describe("the JSON Schema handed to OpenAI", () => {
     expect(realtimeToolDeclarations().map((tool) => tool.name)).toEqual([
       "get_current_time",
       "search_conversations",
+      "web_search",
     ]);
 
     for (const declaration of realtimeToolDeclarations()) {
@@ -112,5 +121,23 @@ describe("argument validation", () => {
     expect(
       searchConversationsTool.input.safeParse({ query: "a", limit: 50 }).success,
     ).toBe(false);
+  });
+
+  /**
+   * The user is listening to silence while this call is out, so the cap is a
+   * latency decision as much as a cost one. Ten pages of excerpts would not
+   * make the spoken answer any better - it would only make it later.
+   */
+  it("caps web_search results at five and defaults to four", () => {
+    expect(webSearchTool.input.parse({ query: "weather in beirut" }).maxResults).toBe(
+      4,
+    );
+    expect(webSearchTool.input.safeParse({ query: "a", maxResults: 25 }).success).toBe(
+      false,
+    );
+    expect(webSearchTool.input.safeParse({ query: "" }).success).toBe(false);
+    expect(webSearchTool.input.safeParse({ query: "x".repeat(201) }).success).toBe(
+      false,
+    );
   });
 });

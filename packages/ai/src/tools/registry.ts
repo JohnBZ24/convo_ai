@@ -5,6 +5,7 @@ import {
   type ToolDefinition,
   toRealtimeTool,
 } from "./tool-definition";
+import { webSearchTool } from "./web-search.tool";
 
 /**
  * Every tool the model is told about, in one list.
@@ -14,7 +15,11 @@ import {
  * answers 404 for anything absent - so a model that hallucinates a tool name
  * gets a clean refusal rather than reaching any code.
  */
-export const TOOLS = [getCurrentTimeTool, searchConversationsTool] as const;
+export const TOOLS = [
+  getCurrentTimeTool,
+  searchConversationsTool,
+  webSearchTool,
+] as const;
 
 export type ToolName = (typeof TOOLS)[number]["name"];
 

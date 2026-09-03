@@ -214,6 +214,11 @@ back, and types the handler. `execution` is the security-relevant field:
   the session. Declared in `@convo/ai`, implemented as a `ToolHandler`, bound to
   its name in `container.ts`.
 
+**`privileged` is not only about the user's data — it is also about OUR keys.**
+`web_search` reaches nothing private; the public web belongs to nobody. It runs
+here because the Exa key would otherwise sit in an APK, where any user can read
+it and spend the budget. Same argument as `OPENAI_API_KEY`, different asset.
+
 `POST /api/tools/:name` fails three different ways on purpose, because they mean
 different things to whoever is debugging:
 
@@ -226,6 +231,39 @@ different things to whoever is debugging:
 Tool handlers must be safe to **re-run**: the idempotency key deduplicates the
 audit row, not the work. A mutating privileged tool would need to cache its own
 result first.
+
+### `web_search`, and why it carries its own limit
+
+`rateLimitMiddleware("tools")` caps the whole endpoint at 120/min/user, which is
+right for tools that only read our database and wrong for one that spends money
+at a third party. `WebSearchUseCase` therefore consumes a **second** budget of
+its own — 30/hour, keyed on `web_search:<userId>` from the session — so a model
+stuck in a loop burns its own allowance and stops, rather than the month's.
+That refusal is `ApplicationError.rateLimited` → **429**, and its message is
+written to be SPOKEN, because the device turns a failed proxy call into
+`{ error }` and hands it straight to the model.
+
+Three things about the Exa adapter that were found by calling it, not by reading
+the docs (3 Sep 2026, `docs/DESIGN.md` §9 has the numbers):
+
+- **Highlights come back as markdown**, headings and all, and one was 2,916
+  characters. `cleanHighlight()` strips `#` markers and Exa's `...` gap lines
+  before the 320-character trim. A surviving `##` is heard as "hash hash".
+- **`favicon` is present for some results and absent for others**, which is why
+  it is `nullable` rather than optional in the contract.
+- **`EXA_SEARCH_TYPE=fast`, and the two neighbouring values are both wrong.**
+  On novel queries `auto` costs ~1230ms, `fast` ~660ms, `instant` ~490ms — but
+  `instant` answered a weather question from a page **five weeks old**, which is
+  disqualifying for a tool that exists for things that change. `fast` matched
+  `auto` on freshness at half the latency. **Never benchmark this by asking the
+  same question twice**: a repeated query is ~250ms at every depth, which makes
+  all three look identical and is how the first measurement of this got it
+  wrong. **This server's own share is 16ms** — Exa is the whole budget, and
+  connection pooling is worth ~35ms, so do not go looking there.
+- **The remaining ~660ms is hidden, not removed.** `CONVO_SYSTEM_PROMPT` orders
+  the model to speak one short line BEFORE calling the tool. If a search ever
+  feels laggy, check that preamble is still happening before assuming Exa slowed
+  down.
 
 ## The device side of a call
 

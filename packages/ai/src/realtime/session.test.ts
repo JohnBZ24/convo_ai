@@ -64,10 +64,11 @@ describe("the client secret request", () => {
     expect(request().session.instructions).toBe(CONVO_SYSTEM_PROMPT);
   });
 
-  it("declares both tools", () => {
+  it("declares every tool in the registry", () => {
     expect(request().session.tools.map((tool) => tool.name)).toEqual([
       "get_current_time",
       "search_conversations",
+      "web_search",
     ]);
   });
 

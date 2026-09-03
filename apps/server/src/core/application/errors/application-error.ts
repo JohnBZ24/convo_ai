@@ -16,6 +16,7 @@ export type ApplicationErrorKind =
   | "invalid-input"
   | "conflict"
   | "forbidden"
+  | "rate-limited"
   | "upstream-failure";
 
 export class ApplicationError extends Error {
@@ -59,6 +60,18 @@ export class ApplicationError extends Error {
    */
   static forbidden(message: string, details?: unknown) {
     return new ApplicationError("forbidden", message, details);
+  }
+
+  /**
+   * The caller has spent a budget, and it is not the ROUTE's budget.
+   *
+   * `rateLimitMiddleware` already caps the tools endpoint as a whole, but a cap
+   * per endpoint cannot express "this one tool costs money at a third party".
+   * Only the use case knows that, which is exactly the test for whether a kind
+   * belongs in this list.
+   */
+  static rateLimited(message: string, details?: unknown) {
+    return new ApplicationError("rate-limited", message, details);
   }
 
   /**

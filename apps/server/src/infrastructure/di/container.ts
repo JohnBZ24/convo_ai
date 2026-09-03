@@ -8,6 +8,7 @@ import type { RealtimeSessionRepository } from "~/core/application/ports/realtim
 import type { SessionAuthenticator } from "~/core/application/ports/session-authenticator.port";
 import type { ToolHandlerRegistry } from "~/core/application/ports/tool-handler.port";
 import type { ToolInvocationRepository } from "~/core/application/ports/tool-invocation-repository.port";
+import type { WebSearchProvider } from "~/core/application/ports/web-search.port";
 import { AppendTurnUseCase } from "~/core/application/use-cases/conversations/append-turn.use-case";
 import { DeleteConversationUseCase } from "~/core/application/use-cases/conversations/delete-conversation.use-case";
 import { EndConversationUseCase } from "~/core/application/use-cases/conversations/end-conversation.use-case";
@@ -23,6 +24,10 @@ import {
   SEARCH_CONVERSATIONS_TOOL_NAME,
   SearchConversationsUseCase,
 } from "~/core/application/use-cases/tools/search-conversations.use-case";
+import {
+  WEB_SEARCH_TOOL_NAME,
+  WebSearchUseCase,
+} from "~/core/application/use-cases/tools/web-search.use-case";
 import { BetterAuthSessionAuthenticator } from "~/infrastructure/auth/better-auth-session.authenticator";
 import { db } from "~/infrastructure/database/database";
 import { DrizzleConversationRepository } from "~/infrastructure/database/drizzle-conversation.repository";
@@ -31,6 +36,7 @@ import { DrizzleRealtimeSessionRepository } from "~/infrastructure/database/driz
 import { DrizzleToolInvocationRepository } from "~/infrastructure/database/drizzle-tool-invocation.repository";
 import { InMemoryRateLimiter } from "~/infrastructure/rate-limiting/in-memory-rate-limiter";
 import { OpenAiRealtimeMinter } from "~/infrastructure/realtime/openai-realtime.minter";
+import { ExaWebSearchProvider } from "~/infrastructure/search/exa-web-search.provider";
 
 /**
  * Everything the presentation layer is allowed to reach for.
@@ -48,6 +54,7 @@ export interface Dependencies {
   sessionAuthenticator: SessionAuthenticator;
   rateLimiter: RateLimiter;
   realtimeCredentialMinter: RealtimeCredentialMinter;
+  webSearchProvider: WebSearchProvider;
   /**
    * Tool name -> implementation. A tool declared privileged in `@convo/ai` with
    * no entry here is a 500 by design, and a test asserts it - so adding a
@@ -106,12 +113,29 @@ export function createContainer(overrides: Partial<Dependencies> = {}): Dependen
       requestTimeoutMs: env.OPENAI_REQUEST_TIMEOUT_MS,
     });
 
+  const rateLimiter = overrides.rateLimiter ?? new InMemoryRateLimiter();
+
+  const webSearchProvider =
+    overrides.webSearchProvider ??
+    new ExaWebSearchProvider({
+      apiKey: env.EXA_API_KEY,
+      baseUrl: env.EXA_BASE_URL,
+      searchType: env.EXA_SEARCH_TYPE,
+      requestTimeoutMs: env.EXA_REQUEST_TIMEOUT_MS,
+    });
+
   const toolHandlers =
     overrides.toolHandlers ??
     ({
       [SEARCH_CONVERSATIONS_TOOL_NAME]: new SearchConversationsUseCase(
         conversationRepository,
       ),
+      /**
+       * The limiter is passed in, not reached for: `web_search` spends real
+       * money at a third party on a prompt-injectable endpoint, so its budget
+       * is enforced by the handler rather than only by the route's own cap.
+       */
+      [WEB_SEARCH_TOOL_NAME]: new WebSearchUseCase(webSearchProvider, rateLimiter),
     } satisfies ToolHandlerRegistry);
 
   return {
@@ -122,8 +146,9 @@ export function createContainer(overrides: Partial<Dependencies> = {}): Dependen
     toolInvocationRepository,
     sessionAuthenticator:
       overrides.sessionAuthenticator ?? new BetterAuthSessionAuthenticator(),
-    rateLimiter: overrides.rateLimiter ?? new InMemoryRateLimiter(),
+    rateLimiter,
     realtimeCredentialMinter,
+    webSearchProvider,
     toolHandlers,
 
     checkLiveness: overrides.checkLiveness ?? new CheckLivenessUseCase(env.APP_VERSION),

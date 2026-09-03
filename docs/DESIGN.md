@@ -589,6 +589,70 @@ Condensed from `HANDOFF.md`; that file has the full detail and the reasoning.
   `PASSWORD_TOO_SHORT` (400).
 - A probe account `claude-probe@example.com` may already exist in the dev database.
 
+**Exa web search, probed live on 3 Sep 2026** (real key, real spend)
+
+- Request: `POST https://api.exa.ai/search`, key in **`x-api-key`** — not a
+  bearer token. `contents.highlights` must be **nested inside `contents`**; at
+  the top level it is silently ignored.
+- Response top level is `requestId, resolvedSearchType, results, searchTime,
+  costDollars`. There is no `searchType` and no `answer` — the model reads the
+  excerpts itself, which is the cost of choosing Exa over an answer-shaped API.
+- **Highlights are markdown.** A weather result came back leading with
+  `# Weather for Beirut, Lebanon` and one highlight was **2,916 characters**.
+  Collapsing whitespace is not enough; the `#` survives and gets SPOKEN.
+  `cleanHighlight()` strips heading markers and Exa's own `...` gap lines.
+- **`favicon` is inconsistent.** Absent on all four weather results, present on
+  three of four F1 results. Hence `nullable` in the contract.
+- **Depth is the biggest lever there is, and the first attempt to measure it was
+  wrong.** That run repeated ONE query six times, so runs two onwards hit Exa's
+  cache and every depth looked identical at ~230ms. Re-measured with 30 distinct
+  questions, each used exactly once, dealt round-robin so no depth got an easier
+  slice:
+
+  | config | median | notes |
+  |---|---|---|
+  | `auto` + highlights + 4 | 1234ms | the original default |
+  | `fast` + highlights + 4 | **662ms** | **the default now** |
+  | `instant` + highlights + 4 | 491ms | see below - do not use |
+  | `instant`, no `contents` | 448ms | highlights cost only 43ms. Keep them. |
+  | `instant` + 2 results | 510ms | fewer results saves nothing |
+
+- **`instant` is disqualified, and it fails in the way that is hardest to
+  notice.** On five time-sensitive questions run at all three depths, `instant`
+  answered "weather in Beirut today" from a **BBC page dated 2026-07-29** - five
+  weeks stale, and superficially a correct-looking temperature. `fast` and
+  `auto` both returned the 2026-09-03 page with 30.2°C. `instant` also missed
+  the league table. Scores: `instant` 4/5 at 547ms, `fast` 4/5 at 764ms, `auto`
+  5/5 at 1756ms. **A depth that is faster and quietly a month out of date is not
+  faster for the user; it is wrong sooner.**
+
+- **What the user actually waits for**, measured through the real endpoint with
+  a real session (12 / 6 / 6 samples, before the switch to `fast`):
+
+  | | min | median | max |
+  |---|---|---|---|
+  | This server alone (403 path, never reaches Exa) | 11ms | **16ms** | 256ms |
+  | Repeated query, Exa warm | 238ms | **253ms** | 354ms |
+  | Novel query, Exa cold (`auto`) | 953ms | **1161ms** | 2159ms |
+
+  **Our own overhead - session lookup, rate limiter, audit row - is 16ms.** It
+  is not worth optimising and never will be; Exa is the entire budget.
+
+- **Connection pooling is not worth doing.** Node closes an idle socket after
+  ~4s, and searches in a real conversation are minutes apart, so it looked like
+  every search would pay a fresh TLS handshake. Measured: back-to-back 287ms,
+  after a 10s idle 322ms. **~35ms.** Not a lever. Do not add an undici Agent for
+  this.
+
+- **The remaining ~660ms is hidden, not removed.** `CONVO_SYSTEM_PROMPT` orders
+  the model to speak one short line BEFORE calling the tool. That is the
+  OpenAI-recommended pattern for a tool call with noticeable latency, and here it
+  is the difference between a second of dead air and a second of "I'll check
+  that now." If the app ever feels laggy on a search, check that the model is
+  still emitting that preamble before assuming the search got slower.
+
+- At the 30/hour per-user cap, worst case is **$0.21/hour/user**.
+
 **Device — Samsung Galaxy Note 8** (re-confirmed over adb today)
 
 - `SM-N950F`, Android 9, API 28. `minSdk` is 24, so it is supported.

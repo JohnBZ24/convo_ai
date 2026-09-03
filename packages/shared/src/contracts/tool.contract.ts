@@ -103,3 +103,49 @@ export const conversationSearchResult = z
 
 export type ConversationSearchHit = z.infer<typeof conversationSearchHit>;
 export type ConversationSearchResult = z.infer<typeof conversationSearchResult>;
+
+/**
+ * How much of one page reaches the model.
+ *
+ * The provider returns query-relevant excerpts, and several of them per page.
+ * Handing all of that to a model whose reply is SPOKEN is the wrong trade twice
+ * over: it costs latency the user hears as silence, and it tempts the model to
+ * read prose aloud instead of answering. Trimmed at the server so the ceiling
+ * holds no matter what the provider decides to return tomorrow.
+ */
+export const WEB_SEARCH_SNIPPET_MAX_LENGTH = 320;
+
+export const webSearchHit = z
+  .object({
+    title: z.string(),
+    url: z.url(),
+    /** The excerpts that matched, joined and trimmed. May be empty. */
+    snippet: z.string(),
+    /** Absent for a great many pages, so nullable rather than optional. */
+    publishedDate: z.string().nullable(),
+    favicon: z.string().nullable(),
+  })
+  .meta({ id: "WebSearchHit", description: "One page found by web_search" });
+
+/**
+ * What `web_search` returns.
+ *
+ * `searchId` exists so the DEVICE can find this result again without the model
+ * retyping it. The phone sees every privileged result on its way back to the
+ * model, so a later tool that draws these sources on screen can reference the
+ * search by id and supply only the words a model has to write - which keeps
+ * URLs out of the model's output, where they can be hallucinated.
+ */
+export const webSearchResult = z
+  .object({
+    searchId: z.string(),
+    query: z.string(),
+    results: z.array(webSearchHit),
+  })
+  .meta({
+    id: "WebSearchResult",
+    description: "The result payload of the web_search tool",
+  });
+
+export type WebSearchHit = z.infer<typeof webSearchHit>;
+export type WebSearchResult = z.infer<typeof webSearchResult>;

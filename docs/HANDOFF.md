@@ -1,6 +1,37 @@
-# Handoff — 3 Sep 2026 (session 5)
+# Handoff — 3 Sep 2026 (session 6)
 
 Read `CLAUDE.md` first for the architecture rules; this file is state, not design.
+
+## Start here
+
+**All seven build steps are done**, and session 7 added an eighth thing on top:
+the `web_search` tool. Iterations 6 and 7 were built, verified on the Note 8 and
+pushed in session 6. There is no half-finished code to pick up.
+
+Everything still open needs a PERSON IN THE ROOM, not code — an agent driving
+`adb` can tap the orb and read `dumpsys`, but it cannot make a sound. In order of
+value:
+
+1. **The self-interruption test.** Iteration 5's exit criterion, still never run
+   under conditions where it could fail honestly. Talk to the phone and confirm
+   the model does not cut itself off while its own voice is in the room.
+2. **Tool calls end to end.** "What time is it" (device), "what did we talk
+   about before" (proxied), and now "what is the weather in Beirut" (proxied,
+   reaches Exa). Every one of these has been driven by curl and none by a MODEL.
+   The model has never once *chosen* to call a tool in a live session.
+3. **Does the model actually speak before it searches?** `CONVO_SYSTEM_PROMPT`
+   orders a one-line preamble before `web_search`, and that line is the only
+   thing between the user and ~770ms of silence. It cannot be tested from a
+   terminal. If a search feels laggy on the phone, check this before assuming
+   Exa got slower.
+4. **A reply-latency median.** One real 366ms sample exists. Run
+   `node scripts/call-metrics.mjs` while holding a real conversation.
+
+Full detail under *What is left* near the end of this file. To run any of it:
+`pnpm server`, then open the app on the phone — the installed APK is current.
+
+If you are instead adding features, read *What iteration 6 actually built* and
+*What iteration 7 actually built* before touching `features/call/`.
 
 ## Read this first: the code is gone
 
@@ -602,37 +633,63 @@ That `E/InCallManager` line is the one to grep for if routing regresses. It is a
 **error-level log that changes nothing observable** except which speaker plays —
 easy to scroll past.
 
-#### Environment, as of this session
+#### Environment, as of the END of session 6
 
-- Release APK rebuilt and installed 3 Sep 11:08. `BUILD SUCCESSFUL in 4m 32s`.
+- **Release APK installed 3 Sep 13:27**, built from `c1a2e1a`. Demo-ready: the
+  perf overlay is OFF. Rebuilding is only needed if you change JS.
+- `origin/main` = `main` = `c1a2e1a`, working tree clean. Iterations 5, 6 and 7
+  were all pushed in session 6 — 5 had been sitting unpushed for two sessions.
 - LAN address is `192.168.10.59`; `apps/mobile/.env` matches. DHCP — recheck it.
 - `adb` is not on PATH: `$LOCALAPPDATA/Android/Sdk/platform-tools/adb.exe`.
-- `JAVA_HOME` is `C:UsersJBZLBjdksjdk-17.0.20+8` (JDK 17, as AGP needs) even
-  though `java` on PATH is 25. Gradle reads `JAVA_HOME`, so builds work as-is.
+- `JAVA_HOME` is `C:\Users\JBZLB\jdks\jdk-17.0.20+8` (JDK 17, as AGP needs)
+  even though `java` on PATH is 25. Gradle reads `JAVA_HOME`, so builds work.
 - Postgres is a native service on 5432, **not** Docker — Docker Desktop is not
   running and `docker ps` fails. `GET /api/ready` is the check that matters.
 - A usable test account exists: `smoke-test@example.com` / `smoke-password-123`.
-  `claude-probe@example.com` exists with an unknown password.
+  The phone is signed in as `baroud3@gmail.com`.
+- Tests: **142 server, 134 mobile, 41 shared, 24 ai, 8 db** = 349.
+
+#### Driving the phone from a session
+
+Everything short of making a sound can be done headlessly, and session 6 did all
+of it this way. The orb sits at `540 833` and the menu button at `83 148` on this
+device's 1080x2220 screen:
+
+```bash
+ADB="$LOCALAPPDATA/Android/Sdk/platform-tools/adb.exe"
+"$ADB" shell monkey -p com.abiroot.convoai -c android.intent.category.LAUNCHER 1
+"$ADB" shell input tap 540 833          # tap the orb (again to hang up)
+"$ADB" exec-out screencap -p > shot.png # look at it
+"$ADB" logcat -s ReactNativeJS          # a RELEASE build DOES log here
+"$ADB" shell dumpsys gfxinfo com.abiroot.convoai   # frame times
+```
+
+A call started this way is a real, billed realtime session. It connects and
+listens; it just has nobody talking to it.
 
 #### What is NOT yet verified
 
 The exit test is *"say hello, hear the reply through the loudspeaker, and confirm
 the model does not interrupt itself"* — and that needs a person to speak. An agent
 driving `adb` can tap the orb and read `dumpsys`, but it cannot make a sound in the
-room. Status after session 5:
+room.
 
 1. ~~The model hears speech and replies out loud.~~ **CLOSED 3 Sep.** A real
    conversation ran on the device: "Hello." → "Hello! What’s on your mind today?"
+   Confirmed again in session 6: that exchange is now STORED, and its first user
+   turn titled the conversation.
 2. It does **not** cut itself off while its own voice is in the room. **STILL
    OPEN, and it has never actually been under test.** Until 3 Sep the audio came
    out of the EARPIECE (see the speaker bug above), so the model’s voice was never
    in the room to be heard back. Every "no self-interruption" observation before
-   that build is void — the loudspeaker was not playing. This is the first build
-   on which the test means anything, and it is the thing most worth doing next.
-3. Tool calls end to end - "what time is it" (device) and "what did we talk about
-   before" (proxied). **STILL OPEN**, untouched this session.
+   that build is void — the loudspeaker was not playing.
+3. Tool calls end to end. **STILL OPEN.**
 
-Everything up to the point where a human has to speak is verified above.
+See *What is left* at the end of this file for the current, consolidated list —
+that is the one to work from, and this section is kept only because items 1 and 2
+carry the reasoning for why the earlier observations were void.
+
+Everything up to the point where a human has to speak is verified.
 
 ### What iteration 6 actually built
 
@@ -1387,6 +1444,47 @@ Everything below was re-confirmed against the iteration-2 server on 20 Aug.
 - Measure frame rate with Reanimated's `PerformanceMonitor` (JS and UI side by
   side). Target UI ≥ 58, JS ≥ 45. Cross-check with *Developer options → Profile
   HWUI rendering* and `adb shell dumpsys gfxinfo <pkg> framestats`.
+
+## What session 7 added: `web_search`
+
+A second privileged tool, and the first thing in this codebase that spends money
+at someone other than OpenAI. `CLAUDE.md` has the rules; `DESIGN.md` section 9
+has the measurements. What matters for picking it up:
+
+- **It is privileged for a NEW reason.** `search_conversations` is privileged
+  because it touches the user's data. `web_search` touches nothing private — the
+  public web belongs to nobody. It runs on the server because the **Exa key**
+  would otherwise sit in an APK where any user can read it and spend the budget.
+  Same argument as `OPENAI_API_KEY`, different asset.
+- **The device needed no changes at all.** `device-tools.ts` routes on the
+  `execution` field, not on names, so a new privileged tool is proxied
+  automatically. That was the design paying off, not luck.
+- **It carries its own rate limit** — 30/hour keyed on `web_search:<userId>` —
+  on top of the route's 120/min, because a prompt-injected loop against a paid
+  API is a different risk than one against our own Postgres. That needed a new
+  `ApplicationError.rateLimited` → 429, and its message is written to be SPOKEN,
+  because the device hands a failed proxy call straight to the model as
+  `{ error }`.
+- **A retry re-spends.** The idempotency key deduplicates the audit row, not the
+  work. Search is safe to re-run, it just is not free at $0.007 a time. The
+  hourly cap is what bounds it.
+
+Verified against real Exa and the running server on 3 Sep 2026: a real search
+(200, correct current temperature for Beirut), a replay (`replayed: true`), a
+device tool proxied (403), an invented name (404), bad arguments (400 with
+per-field detail), and no bearer token (401).
+
+**Two measurement traps, both of which caught this session:**
+
+1. **Never benchmark Exa by asking the same question twice.** A repeated query
+   returns in ~250ms at every search depth, which makes all depths look
+   identical. The first attempt at the depth comparison did exactly this and
+   concluded "depth does not matter". Re-measured with 30 distinct questions,
+   depth turned out to be the single biggest lever: `auto` 1234ms, `fast` 662ms.
+2. **`instant` is a trap.** It is the fastest depth and it answered a Beirut
+   weather question from a page dated **2026-07-29** — five weeks stale, with a
+   plausible-looking temperature. `fast` and `auto` both returned that day's
+   30.2°C. Faster and quietly out of date is not faster.
 
 ## Known gaps, deliberately
 

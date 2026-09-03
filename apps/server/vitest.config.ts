@@ -21,6 +21,7 @@ export default defineConfig({
       APP_VERSION: "0.0.0-test",
       DATABASE_URL: "postgres://placeholder:placeholder@127.0.0.1:5432/placeholder",
       OPENAI_API_KEY: "sk-placeholder",
+      EXA_API_KEY: "exa-placeholder",
       BETTER_AUTH_SECRET: "placeholder-secret-for-tests-only",
       BETTER_AUTH_URL: "http://127.0.0.1:3000",
       DOCS_ENABLED: "true",
