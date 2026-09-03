@@ -4,34 +4,79 @@ Read `CLAUDE.md` first for the architecture rules; this file is state, not desig
 
 ## Start here
 
-**All seven build steps are done**, and session 7 added an eighth thing on top:
-the `web_search` tool. Iterations 6 and 7 were built, verified on the Note 8 and
-pushed in session 6. There is no half-finished code to pick up.
+**Session 7 left work UNCOMMITTED. Read this whole section before touching
+anything.**
 
-Everything still open needs a PERSON IN THE ROOM, not code — an agent driving
-`adb` can tap the orb and read `dumpsys`, but it cannot make a sound. In order of
-value:
+State of the tree, 3 Sep 2026:
 
-1. **The self-interruption test.** Iteration 5's exit criterion, still never run
-   under conditions where it could fail honestly. Talk to the phone and confirm
-   the model does not cut itself off while its own voice is in the room.
-2. **Tool calls end to end.** "What time is it" (device), "what did we talk
-   about before" (proxied), and now "what is the weather in Beirut" (proxied,
-   reaches Exa). Every one of these has been driven by curl and none by a MODEL.
-   The model has never once *chosen* to call a tool in a live session.
-3. **Does the model actually speak before it searches?** `CONVO_SYSTEM_PROMPT`
-   orders a one-line preamble before `web_search`, and that line is the only
-   thing between the user and ~770ms of silence. It cannot be tested from a
-   terminal. If a search feels laggy on the phone, check this before assuming
+- Branch `feat/web-search`, commit `e755160`, **pushed** - the `web_search`
+  backend. Complete, tested against real Exa, verified through the running
+  server. Nothing to finish there.
+- **15 uncommitted files on top of it: the `show_card` popup.** Written, wired
+  and green (391 tests), and committed nowhere. This project has already lost a
+  finished backend once. Commit it before doing anything else.
+
+### Step 0 - start the server, and do not forget it
+
+```bash
+pnpm server        # must be running, on the machine the phone points at
+```
+
+`apps/mobile/.env` sets `EXPO_PUBLIC_API_BASE_URL=http://192.168.10.59:3000`.
+That is a LAN address, so **the phone talks to a specific machine and fails
+silently when nothing is listening**: the conversation list spins and then gives
+up, which reads exactly like a bug in the app. This cost time in session 7 for
+that reason. Confirm with the address the PHONE uses, not localhost:
+
+```bash
+curl http://192.168.10.59:3000/api/health     # {"status":"ok",...}
+```
+
+If the machine's IP has changed, update `apps/mobile/.env` **and rebuild** -
+Metro inlines `EXPO_PUBLIC_*` at build time.
+
+### Step 1 - the installed APK is missing both new tools
+
+The APK on the Note 8 was built at 13:26 on 3 Sep; the tools landed at 15:17.
+Unzipping its bundle:
+
+```
+PRESENT  get_current_time        MISSING  web_search
+PRESENT  search_conversations    MISSING  show_card
+```
+
+This produces a confusing failure, because the two halves disagree: the SERVER
+mints a credential declaring all four tools, the model calls `web_search`, and
+the PHONE answers `There is no tool called web_search` because its bundled copy
+of `@convo/ai` predates it. Nothing about restarting the app fixes it.
+
+```bash
+pnpm mobile:android
+```
+
+**Do not edit any source file while that runs.** Expo writes the JS bundle in the
+first ~30 seconds; anything changed after that is silently absent from the APK
+while the build still reports success.
+
+### Step 2 - what has never been tested
+
+Everything below needs a PERSON IN THE ROOM. An agent driving `adb` can tap the
+orb and read `dumpsys`, but it cannot make a sound.
+
+1. **The model has never once CHOSEN to call a tool.** Every tool call so far
+   was made by curl. Ask "what is the weather in Beirut" and watch whether it
+   calls `web_search`, then `show_card`.
+2. **Does it speak before it searches?** `CONVO_SYSTEM_PROMPT` orders a one-line
+   preamble before `web_search`, and that line is the only thing between the user
+   and ~770ms of silence. If a search feels laggy, check this before assuming
    Exa got slower.
-4. **A reply-latency median.** One real 366ms sample exists. Run
+3. **Does it call `show_card` at all?** Nothing forces it - it is an instruction,
+   and instructions are requests. If it reliably forgets, the fallback is written
+   up under *What session 7 added: the popup*.
+4. **The self-interruption test.** Iteration 5's exit criterion, still never run
+   under conditions where it could fail honestly.
+5. **A reply-latency median.** One real 366ms sample exists. Run
    `node scripts/call-metrics.mjs` while holding a real conversation.
-
-Full detail under *What is left* near the end of this file. To run any of it:
-`pnpm server`, then open the app on the phone — the installed APK is current.
-
-If you are instead adding features, read *What iteration 6 actually built* and
-*What iteration 7 actually built* before touching `features/call/`.
 
 ## Read this first: the code is gone
 
@@ -1485,6 +1530,63 @@ per-field detail), and no bearer token (401).
    weather question from a page dated **2026-07-29** — five weeks stale, with a
    plausible-looking temperature. `fast` and `auto` both returned that day's
    30.2°C. Faster and quietly out of date is not faster.
+
+## What session 7 added: the popup (`show_card`) - UNCOMMITTED
+
+The second half of the pair. `web_search` finds things; `show_card` puts one on
+screen. It is a **device** tool - the server refuses to proxy it with 403, and a
+test pins `execution === "device"` so it cannot quietly become an endpoint.
+
+**The one idea to understand.** The model sends an ID, not a payload:
+
+```
+show_card({ searchId: "59f4a827...", title: "Beirut, Lebanon", subtitle: "30C" })
+```
+
+Every `web_search` result passes through the phone on its way back to the model,
+so the snippets and links are ALREADY on the device. `search-memory.ts` keeps
+them, keyed by `searchId`. The model supplies only the headline it alone can
+write - "30C" is not a field anywhere, it is buried mid-prose in a 320-character
+snippet, Fahrenheit first - and the device attaches the real sources. That keeps
+URLs out of model output, where they can be invented, and keeps output tokens
+down, which in this app is speech latency.
+
+**Why the ordering is safe.** `rememberSearch()` runs BEFORE `runFunctionCall`
+resolves, and the model only learns a `searchId` exists from the string it
+resolves with. So there is no window in which a valid id exists that the device
+cannot look up, however the calls are scheduled. `device-tools.test.ts` pins that
+ordering - move the remember call after the return and that test fails, which is
+the only thing that would say so.
+
+**Files.** New: `packages/ai/src/tools/show-card.tool.ts`,
+`features/call/search-memory.ts`, `features/call/card-store.ts`,
+`features/call/result-card.tsx`, plus two test files. Changed: the registry and
+its three hardcoded name lists, `device-tools.ts`, `use-call-session.ts`,
+`app/index.tsx`.
+
+**Two traps already paid for, do not reintroduce:**
+
+1. **`new URL()` is not safe on this platform.** Source hosts are parsed with a
+   regex in `card-store.ts`. React Native ships the partial implementation whose
+   `URLSearchParams` throws on `set`/`get`/`delete` - the same reason query
+   strings in `lib/api` are built by hand. A regex cannot throw mid-call.
+2. **Ending a call while a `show_card` is in flight** used to pop a card AFTER
+   the orb went idle, because tool dispatch is async and the teardown effect is
+   not ordered against it. Guarded by testing `sessionRef`, which teardown nulls
+   synchronously. That guard lives in `use-call-session.ts`, which is the
+   untested React layer - so it is NOT covered by a test. Do not remove it.
+
+**The fallback, if the model will not call it.** Have the device auto-show a
+minimal card the moment `web_search` returns - title = the query, plus the first
+snippet - and let `show_card` UPGRADE it with the real headline when the model
+gets there. Something appears in ~772ms guaranteed; the good headline follows.
+Cost: a card for every search, including ones where it is noise. About 15 lines
+in `device-tools.ts` and `card-store.ts`; the memory and the store already exist.
+
+**Not tested, and not testable here:** `result-card.tsx` itself. vitest's include
+is `*.test.ts`, there is no `.tsx` support, no jsdom and no RN testing library -
+which is exactly why all the logic lives in the `.ts` files beside it. The
+component needs a real look on the device.
 
 ## Known gaps, deliberately
 

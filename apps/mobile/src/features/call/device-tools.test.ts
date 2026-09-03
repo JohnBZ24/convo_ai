@@ -13,11 +13,17 @@ function proxyMock(result: unknown = { ok: true }) {
   return vi.fn(async (_name: string, _request: ToolProxyRequest) => result);
 }
 
-function depsWith(proxy: DeviceToolDeps["proxy"] = proxyMock()): DeviceToolDeps {
+function depsWith(
+  proxy: DeviceToolDeps["proxy"] = proxyMock(),
+  overrides: Partial<DeviceToolDeps> = {},
+): DeviceToolDeps {
   return {
     proxy,
     now: () => FIXED_NOW,
     deviceTimeZone: () => "Asia/Beirut",
+    rememberSearch: vi.fn(),
+    showCard: vi.fn(() => true),
+    ...overrides,
   };
 }
 
@@ -164,5 +170,128 @@ describe("routing a model function call", () => {
     );
 
     expect(result.error).toBe("Rate limit exceeded");
+  });
+});
+
+/**
+ * The two halves of the card feature meet here: a privileged result is captured
+ * on its way past, and a device tool later points at it by id. Neither half is
+ * useful without the other, so both are pinned in the same file that owns the
+ * routing decision.
+ */
+describe("the search / card pair", () => {
+  it("remembers a web_search result as it passes back to the model", async () => {
+    const result = { searchId: "ws_1", query: "beirut", results: [] };
+    const rememberSearch = vi.fn();
+
+    const output = await runFunctionCall(
+      call("web_search", JSON.stringify({ query: "beirut" })),
+      null,
+      depsWith(proxyMock(result), { rememberSearch }),
+    );
+
+    expect(rememberSearch).toHaveBeenCalledWith(result);
+    // Captured on the way past - the model still gets the result verbatim.
+    expect(JSON.parse(output)).toEqual(result);
+  });
+
+  /**
+   * The ordering that makes the whole pair race-free, pinned so a refactor
+   * cannot quietly invert it.
+   *
+   * The model cannot ask to show a search it has not been told about, and it is
+   * told by the string this function RESOLVES with. So as long as the memory is
+   * written before that resolve, there is no window in which a valid searchId
+   * exists that the device cannot look up - regardless of how the two calls are
+   * scheduled. Move `rememberSearch` after the return and that guarantee is
+   * gone, with nothing else failing to say so.
+   */
+  it("writes to memory BEFORE the model is told the searchId exists", async () => {
+    const order: string[] = [];
+    const result = { searchId: "ws_1", query: "beirut", results: [] };
+
+    const output = await runFunctionCall(
+      call("web_search", JSON.stringify({ query: "beirut" })),
+      null,
+      depsWith(
+        vi.fn(async (_name: string, _request: ToolProxyRequest) => {
+          order.push("search returns");
+          return result;
+        }),
+        { rememberSearch: () => order.push("remembered") },
+      ),
+    );
+
+    order.push("model told");
+
+    expect(order).toEqual(["search returns", "remembered", "model told"]);
+    // And what the model is told is where the id first appears.
+    expect(output).toContain("ws_1");
+  });
+
+  it("does not remember the result of any other privileged tool", async () => {
+    const rememberSearch = vi.fn();
+
+    await runFunctionCall(
+      call("search_conversations", JSON.stringify({ query: "x" })),
+      null,
+      depsWith(proxyMock({ query: "x", matches: [] }), { rememberSearch }),
+    );
+
+    expect(rememberSearch).not.toHaveBeenCalled();
+  });
+
+  it("shows a card on the device and never proxies it", async () => {
+    const proxy = proxyMock();
+    const showCard = vi.fn(() => true);
+
+    const output = await runFunctionCall(
+      call(
+        "show_card",
+        JSON.stringify({ searchId: "ws_1", title: "Beirut", subtitle: "30C" }),
+      ),
+      null,
+      depsWith(proxy, { showCard }),
+    );
+
+    expect(showCard).toHaveBeenCalledWith({
+      searchId: "ws_1",
+      title: "Beirut",
+      subtitle: "30C",
+    });
+    expect(JSON.parse(output)).toEqual({ shown: true });
+    // The server answers 403 for a device tool. Not reaching it at all is better.
+    expect(proxy).not.toHaveBeenCalled();
+  });
+
+  /**
+   * The model quoting an id from a search that never happened - usually because
+   * it tried to show a card without searching first. It gets a sentence it can
+   * recover from, not a crash and not an empty card.
+   */
+  it("tells the model when the id names a search this device never saw", async () => {
+    const output = await runFunctionCall(
+      call(
+        "show_card",
+        JSON.stringify({ searchId: "made_up", title: "T", subtitle: "S" }),
+      ),
+      null,
+      depsWith(proxyMock(), { showCard: vi.fn(() => false) }),
+    );
+
+    expect(JSON.parse(output).error).toMatch(/Search first/);
+  });
+
+  it("rejects card arguments the schema forbids before any of this runs", async () => {
+    const showCard = vi.fn(() => true);
+
+    const output = await runFunctionCall(
+      call("show_card", JSON.stringify({ searchId: "ws_1", title: "", subtitle: "S" })),
+      null,
+      depsWith(proxyMock(), { showCard }),
+    );
+
+    expect(JSON.parse(output).error).toContain("not valid");
+    expect(showCard).not.toHaveBeenCalled();
   });
 });

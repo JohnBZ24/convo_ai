@@ -1,4 +1,10 @@
-import { findTool, getCurrentTimeTool } from "@convo/ai";
+import {
+  findTool,
+  getCurrentTimeTool,
+  type ShowCardArgs,
+  showCardTool,
+  webSearchTool,
+} from "@convo/ai";
 import type { RealtimeFunctionCall } from "./realtime-events";
 
 /**
@@ -25,6 +31,19 @@ export interface DeviceToolDeps {
   now: () => Date;
   /** The device's own IANA zone, used when the model does not name one. */
   deviceTimeZone: () => string;
+  /**
+   * Hand a `web_search` result to whatever remembers it, on its way past.
+   *
+   * This is the whole reason `show_card` can take an id rather than a payload:
+   * the snippets and links are already ON this device by the time the model
+   * decides to display them.
+   */
+  rememberSearch: (result: unknown) => void;
+  /**
+   * Draw a card. FALSE when the id names a search this device never saw, which
+   * is the model quoting an id it invented.
+   */
+  showCard: (args: ShowCardArgs) => boolean;
 }
 
 /**
@@ -79,6 +98,16 @@ export async function runFunctionCall(
       // Ownership is NEVER sent. It comes from the session, on the server.
       conversationId: conversationId ?? undefined,
     });
+
+    if (call.name === webSearchTool.name) {
+      /**
+       * Kept on the way past, NOT re-fetched later. The model gets the same
+       * JSON either way; this device just stops throwing away the half of it
+       * that a card needs.
+       */
+      deps.rememberSearch(result);
+    }
+
     return JSON.stringify(result ?? null);
   } catch (error) {
     return fail(errorMessage(error));
@@ -92,6 +121,22 @@ function runOnDevice(
 ): string {
   if (name === getCurrentTimeTool.name) {
     return JSON.stringify(currentTime(args.timeZone, deps));
+  }
+
+  if (name === showCardTool.name) {
+    const shown = deps.showCard(args as unknown as ShowCardArgs);
+
+    /**
+     * A refusal the model can act on, not a crash. It quoted an id from a
+     * search that never happened - usually because it tried to show a card
+     * without searching first - and the useful thing is to say so in a sentence
+     * it can recover from.
+     */
+    return shown
+      ? JSON.stringify({ shown: true })
+      : fail(
+          "There is no search with that id, so nothing was shown. Search first, then show the card for that search.",
+        );
   }
 
   // A declared device tool with no implementation is OUR bug, and it reads as

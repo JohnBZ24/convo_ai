@@ -14,10 +14,12 @@ import { useLiveAmplitude } from "./amplitude";
 import { beginCallAudio, endCallAudio } from "./audio-route";
 import { ReplyLatency } from "./call-metrics";
 import { useCallStore } from "./call-store";
+import { dismissResultCard, showResultCard, toResultCard } from "./card-store";
 import { type DeviceToolDeps, runFunctionCall } from "./device-tools";
 import { describeFailure, isWorthRetrying } from "./failure-message";
 import type { RealtimeEvent, RealtimeFunctionCall } from "./realtime-events";
 import { RealtimeSession, type RealtimeSessionDeps } from "./realtime-session";
+import { SearchMemory } from "./search-memory";
 import {
   emptyTranscript,
   reduceTranscript,
@@ -122,6 +124,14 @@ export function useCallSession(): readonly TranscriptLine[] {
   /** Function calls already answered. `response.done` can repeat one. */
   const answered = useRef(new Set<string>());
 
+  /**
+   * What `web_search` found, kept for `show_card` to point at.
+   *
+   * Per session, in a ref: a card belongs to the call it was searched in, and a
+   * new call should not be able to display the last one's results.
+   */
+  const searchesRef = useRef(new SearchMemory());
+
   const dispatchCall = useCallback(async (call: RealtimeFunctionCall) => {
     const session = sessionRef.current;
     const bearer = tokenRef.current;
@@ -136,6 +146,28 @@ export function useCallSession(): readonly TranscriptLine[] {
       },
       now: () => new Date(),
       deviceTimeZone,
+      rememberSearch: (result) => searchesRef.current.remember(result),
+      showCard: (args) => {
+        /**
+         * The call may have ENDED while this dispatch was in flight.
+         *
+         * Tool dispatch is async and the teardown effect is not ordered against
+         * it, so a `show_card` that resolves just after the user hangs up would
+         * otherwise run `showResultCard` AFTER the teardown already cleared the
+         * screen - and the card would sit there, over an idle orb, belonging to
+         * a conversation that is over. `sessionRef` is nulled synchronously by
+         * that effect, which makes it the reliable thing to test.
+         */
+        if (!sessionRef.current) return false;
+
+        const remembered = searchesRef.current.recall(args.searchId);
+        // The model quoted an id from a search this device never saw. Say so
+        // rather than drawing an empty card.
+        if (!remembered) return false;
+
+        showResultCard(toResultCard(remembered, args));
+        return true;
+      },
     };
 
     const output = await runFunctionCall(call, session.conversationId, deps);
@@ -415,6 +447,14 @@ export function useCallSession(): readonly TranscriptLine[] {
   /** Closes it. `ending` is the user hanging up; `error` is everything else. */
   useEffect(() => {
     if (phase !== "ending" && phase !== "error") return undefined;
+
+    /**
+     * A card belongs to the call it was searched in. Leaving one on screen
+     * after the orb goes idle would have the app still answering a question
+     * nobody is in a conversation about any more.
+     */
+    dismissResultCard();
+    searchesRef.current.clear();
 
     const session = sessionRef.current;
     sessionRef.current = null;

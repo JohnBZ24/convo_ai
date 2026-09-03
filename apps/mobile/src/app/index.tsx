@@ -12,6 +12,7 @@ import {
   useCallStore,
 } from "~/features/call/call-store";
 import { Orb } from "~/features/call/orb";
+import { ResultCard } from "~/features/call/result-card";
 import { Transcript } from "~/features/call/transcript";
 import { useCallSession } from "~/features/call/use-call-session";
 import { useNetworkStore } from "~/features/network/network-store";
@@ -191,6 +192,14 @@ export default function VoiceScreen() {
         <View style={styles.transcript}>
           <Transcript lines={lines} />
         </View>
+
+        {/*
+          Last child, so it paints over the transcript, and a component of its
+          own subscribing to its own store - the re-renders this screen does
+          several times a sentence never reach it, and a card arriving never
+          reconciles the orb.
+        */}
+        <ResultCard />
       </View>
     </Sidebar>
   );

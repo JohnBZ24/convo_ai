@@ -69,6 +69,7 @@ describe("the client secret request", () => {
       "get_current_time",
       "search_conversations",
       "web_search",
+      "show_card",
     ]);
   });
 

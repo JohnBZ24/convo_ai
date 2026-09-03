@@ -1,5 +1,6 @@
 import { getCurrentTimeTool } from "./get-current-time.tool";
 import { searchConversationsTool } from "./search-conversations.tool";
+import { showCardTool } from "./show-card.tool";
 import {
   type RealtimeFunctionTool,
   type ToolDefinition,
@@ -19,6 +20,7 @@ export const TOOLS = [
   getCurrentTimeTool,
   searchConversationsTool,
   webSearchTool,
+  showCardTool,
 ] as const;
 
 export type ToolName = (typeof TOOLS)[number]["name"];

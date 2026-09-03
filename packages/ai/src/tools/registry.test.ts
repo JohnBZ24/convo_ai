@@ -7,6 +7,7 @@ import {
   TOOLS,
 } from "./registry";
 import { searchConversationsTool } from "./search-conversations.tool";
+import { showCardTool } from "./show-card.tool";
 import { toParameterSchema } from "./tool-definition";
 import { webSearchTool } from "./web-search.tool";
 
@@ -34,8 +35,14 @@ describe("the registry", () => {
    * tool - the server has no better clock than the phone, and proxying it would
    * establish "the model asked, so we ran it" as an acceptable pattern.
    */
-  it("keeps get_current_time on the device and the other two privileged", () => {
+  it("keeps the device tools on the device and the paid ones privileged", () => {
     expect(getCurrentTimeTool.execution).toBe("device");
+    /**
+     * There is no version of "draw on the user's screen" a server could
+     * perform. If this ever flips to privileged, `POST /api/tools/show_card`
+     * becomes a real endpoint and the split stops being a boundary.
+     */
+    expect(showCardTool.execution).toBe("device");
     expect(searchConversationsTool.execution).toBe("privileged");
     /**
      * `web_search` is privileged for a different reason than
@@ -93,6 +100,7 @@ describe("the JSON Schema handed to OpenAI", () => {
       "get_current_time",
       "search_conversations",
       "web_search",
+      "show_card",
     ]);
 
     for (const declaration of realtimeToolDeclarations()) {

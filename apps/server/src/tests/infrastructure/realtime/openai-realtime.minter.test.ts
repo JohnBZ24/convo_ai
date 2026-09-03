@@ -96,6 +96,7 @@ describe("the request it sends", () => {
       "get_current_time",
       "search_conversations",
       "web_search",
+      "show_card",
     ]);
   });
 
