@@ -65,7 +65,10 @@ export class InMemoryConversationRepository implements ConversationRepository {
     options: ListConversationsOptions,
   ): Promise<ConversationPage> {
     const ordered = [...this.conversations.values()]
-      .filter((c) => c.userId === userId)
+      // The search term is part of the predicate here too, not applied to a
+      // page afterwards - a fake that paged first and filtered second would
+      // hide the bug this ordering exists to prevent.
+      .filter((c) => c.userId === userId && this.matches(c, options.query))
       .sort((a, b) => {
         const byTime = b.startedAt.getTime() - a.startedAt.getTime();
         return byTime !== 0 ? byTime : b.id.localeCompare(a.id);
@@ -89,28 +92,37 @@ export class InMemoryConversationRepository implements ConversationRepository {
 
   /**
    * Mirrors the SQL: case-insensitive substring over the title OR any turn's
-   * text, scoped by user, newest first, capped.
+   * text. Null matches everything, which is what an absent search box means.
+   *
+   * Shared by `list` and `search` for the same reason the SQL predicate is:
+   * the box a person types into and the tool the model calls have to agree
+   * about what "matches" means.
    *
    * Wildcards are LITERAL here, because the real implementation escapes them
    * before they reach the LIKE pattern. A fake that let "%" match everything
    * would quietly stop testing the thing that matters most about this method.
    */
+  private matches(conversation: Conversation, query: string | null): boolean {
+    if (!query) return true;
+
+    const needle = query.toLowerCase();
+    if (conversation.title?.toLowerCase().includes(needle)) return true;
+
+    return (this.turns.get(conversation.id) ?? []).some((turn) =>
+      turn.text.toLowerCase().includes(needle),
+    );
+  }
+
+  /** Newest first, capped. Scoped by user, as every method here is. */
   async search(
     userId: string,
     options: SearchConversationsOptions,
   ): Promise<Conversation[]> {
-    const needle = options.query.toLowerCase();
-
-    const matches = (conversation: Conversation) => {
-      if (conversation.title?.toLowerCase().includes(needle)) return true;
-
-      return (this.turns.get(conversation.id) ?? []).some((turn) =>
-        turn.text.toLowerCase().includes(needle),
-      );
-    };
-
     return [...this.conversations.values()]
-      .filter((conversation) => conversation.userId === userId && matches(conversation))
+      .filter(
+        (conversation) =>
+          conversation.userId === userId && this.matches(conversation, options.query),
+      )
       .sort((a, b) => b.startedAt.getTime() - a.startedAt.getTime())
       .slice(0, options.limit);
   }
@@ -122,6 +134,32 @@ export class InMemoryConversationRepository implements ConversationRepository {
     const ended = conversation.end(at);
     this.conversations.set(id, ended);
     return ended;
+  }
+
+  async rename(
+    userId: string,
+    id: string,
+    title: string,
+  ): Promise<Conversation | null> {
+    const conversation = await this.findById(userId, id);
+    if (!conversation) return null;
+
+    const renamed = conversation.rename(title);
+    this.conversations.set(id, renamed);
+    return renamed;
+  }
+
+  async delete(userId: string, id: string): Promise<boolean> {
+    // The ownership check first, as the SQL predicate does it - a stranger's
+    // conversation must not be removable and must not report that it exists.
+    const conversation = await this.findById(userId, id);
+    if (!conversation) return false;
+
+    this.conversations.delete(id);
+    // Standing in for ON DELETE CASCADE. A fake that left the turns behind
+    // would not be reproducing what the database actually does.
+    this.turns.delete(id);
+    return true;
   }
 
   async appendTurn(

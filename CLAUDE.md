@@ -239,6 +239,7 @@ instinct as the server's ports, for the same reason plus one practical one.
 | `transcript-assembler.ts` | no | ✅ a pure reducer |
 | `realtime-session.ts` | no | ✅ the connect ORDER |
 | `device-tools.ts` | no | ✅ device vs proxied routing |
+| `turn-recorder.ts` | no | ✅ seq assignment + retry |
 | `webrtc-adapter.ts` | **yes** — `react-native-webrtc` | — |
 | `audio-route.ts` | **yes** — `react-native-incall-manager` | — |
 | `use-call-session.ts` | **yes** — the React wiring | — |
@@ -274,6 +275,54 @@ Three things about the call that are easy to get wrong:
 instructions, tools and VAD config to the credential at mint time. Pushing them
 again from the phone would make the system prompt client-rewritable, which is the
 one boundary this whole design exists to hold.
+
+## Conversation persistence and the sidebar
+
+Added in iteration 6. Three rules here are load-bearing.
+
+**`seq` is a POSITION, not a counter.** `features/call/turn-recorder.ts` takes it
+from the line's slot index in the transcript assembler's order, 1-based. Input
+transcription is asynchronous — the model's reply finishes before the user's
+own words are transcribed, which is why `input_audio_buffer.committed` is handled
+at all — so a counter incremented on each `*.transcript.done` would number the
+REPLY 1 and the QUESTION 2, and the stored conversation would read backwards. It
+is also what makes a retry safe: the same line always computes the same seq, so a
+second POST collides with the unique index and is answered `replayed: true`.
+Never replace it with a counter.
+
+**`PATCH /api/conversations/{id}` takes a UNION, not optional fields.**
+`{ title }` renames, `{ status: "ended" }` ends. Declared as
+`z.union([renameConversationBody, endConversationBody])` so both intents appear
+in the OpenAPI document and `{}` is rejected by the schema — a `.refine()`
+would enforce it at runtime and vanish from the published document. The
+controller branching on `"title" in body` is the one branch in that file, and it
+is deciding what the request MEANS, which is presentation's job.
+
+**Search is server-side, and it must stay that way.** `GET /api/conversations?q=`
+matches a conversation's title OR the text of any turn in it, and the term joins
+the same WHERE clause as the keyset cursor. Filtering a fetched page on the
+device would only ever match titles — the words live in Postgres — and it
+would break "load more", because a page of thirty rows may hold two matches.
+`matchesQuery()` in `drizzle-conversation.repository.ts` is shared with the
+`search_conversations` tool so the box a person types into and the tool the model
+calls cannot drift.
+
+`DELETE /api/conversations/{id}` is deliberately NOT idempotent: 204, then 404.
+Ending is fired by the device as a call tears down and must survive a retry;
+deleting is a person tapping once. Turns go by `ON DELETE CASCADE`; the
+`realtime_sessions` and `tool_invocations` audit rows are `SET NULL` and survive.
+
+On the device, `components/sidebar.tsx` is ONLY the drawer shell — the list,
+search, rename and delete live in `features/conversations/conversation-list.tsx`,
+which fetches its own data. That is not tidiness: the voice screen re-renders
+several times a sentence, and a search term held up there would reconcile the
+whole drawer panel behind the next tap.
+
+Two React Native traps in this code, both of the "curl is not a phone" family:
+`URLSearchParams` is a STUB here (`set`, `get`, `delete` throw; no `size`), so
+query strings are built by hand; and a release build's JS bundle is written by
+Expo in the first ~30 seconds, so **source edited after `expo run:android`
+starts is silently absent from the APK** while the build still reports success.
 
 ## Health endpoints
 

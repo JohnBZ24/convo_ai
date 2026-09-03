@@ -78,7 +78,7 @@ async function toError(response: Response): Promise<ApiRequestError> {
 export const REQUEST_TIMEOUT_MS = 10_000;
 
 export interface RequestOptions {
-  method?: "GET" | "POST" | "PATCH";
+  method?: "GET" | "POST" | "PATCH" | "DELETE";
   body?: unknown;
   token?: string | null;
   /** Better Auth answers with the bearer token in a RESPONSE header, not the body. */

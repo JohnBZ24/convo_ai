@@ -4,10 +4,10 @@ import {
   conversationDetail,
   conversationIdParams,
   conversationList,
+  conversationListQuery,
   conversationSummary,
-  endConversationBody,
   errorEnvelope,
-  paginationQuery,
+  updateConversationBody,
 } from "@convo/shared";
 import { container } from "~/infrastructure/di/container";
 import { currentUser } from "~/presentation/http/authenticated-user";
@@ -22,9 +22,14 @@ import {
  * The HTTP adapter for conversations.
  *
  * Every handler is the same four lines: take the user from the session, call
- * one use case, map the result to the wire shape, choose a status. No branching
- * on data, no queries, no ownership checks - those live in the use case and the
- * repository respectively, where they are testable without a request.
+ * one use case, map the result to the wire shape, choose a status. No queries
+ * and no ownership checks - those live in the use case and the repository
+ * respectively, where they are testable without a request.
+ *
+ * `updateConversation` is the one handler that branches, and on the SHAPE of
+ * the body rather than on its data: deciding whether a PATCH means "rename" or
+ * "end" is deciding what the request means, which is this layer's job. Which
+ * rows that then touches is not.
  *
  * `requiresAuth: true` on each spec is what puts the padlock in Swagger AND
  * enforces the 401 at runtime; see defineHandler.
@@ -54,17 +59,23 @@ export const listConversations = defineHandler({
   path: "/api/conversations",
   summary: "List conversations",
   description:
-    "The signed-in user's conversations, newest first, keyset paginated. Pass the `nextCursor` from the previous page as `cursor`; a null `nextCursor` means there are no more. Cursors are opaque - do not construct one.",
+    "The signed-in user's conversations, newest first, keyset paginated. Pass the `nextCursor` from the previous page as `cursor`; a null `nextCursor` means there are no more. Cursors are opaque - do not construct one. Pass `q` to search: it matches a conversation's title or the text of anything said in it, case-insensitively, and pages exactly like an unfiltered list.",
   tags: ["conversations"],
   requiresAuth: true,
-  query: paginationQuery,
-  responses: { 200: conversationList, 400: errorEnvelope, 401: errorEnvelope },
+  query: conversationListQuery,
+  responses: {
+    200: conversationList,
+    400: errorEnvelope,
+    401: errorEnvelope,
+    422: errorEnvelope,
+  },
   handler: async ({ context, query }) => {
     const user = currentUser(context);
 
     const page = await container.listConversations.execute(user.id, {
       limit: query.limit,
       cursor: query.cursor,
+      query: query.q,
     });
 
     return {
@@ -100,33 +111,60 @@ export const getConversation = defineHandler({
   },
 });
 
-export const endConversation = defineHandler({
-  operationId: "endConversation",
+export const updateConversation = defineHandler({
+  operationId: "updateConversation",
   method: "patch",
   path: "/api/conversations/{id}",
-  summary: "End a conversation",
+  summary: "Rename a conversation, or end it",
   description:
-    "Marks the conversation ended and stamps `endedAt`. Idempotent: ending an already-ended conversation succeeds and returns the ORIGINAL `endedAt`, because the device fires this as the call tears down - the least reliable moment on a mobile connection.",
+    'Two intents behind one PATCH. `{ "title": "..." }` renames it - the one title the user chooses rather than the server deriving. `{ "status": "ended" }` closes it and stamps `endedAt`, and is idempotent: ending an already-ended conversation succeeds and returns the ORIGINAL `endedAt`, because the device fires it as the call tears down - the least reliable moment on a mobile connection.',
   tags: ["conversations"],
   requiresAuth: true,
   params: conversationIdParams,
-  body: endConversationBody,
+  body: updateConversationBody,
   responses: {
     200: conversationSummary,
     400: errorEnvelope,
     401: errorEnvelope,
     404: errorEnvelope,
+    422: errorEnvelope,
   },
+  handler: async ({ body, context, params }) => {
+    const user = currentUser(context);
+
+    /**
+     * The one place this file decides anything, and it is deciding what the
+     * REQUEST MEANS rather than what should happen - which is exactly the
+     * split between a controller and a use case. The union has two members, so
+     * this is exhaustive: there is no third shape to fall through to.
+     */
+    const conversation =
+      "title" in body
+        ? await container.renameConversation.execute(user.id, params.id, body.title)
+        : await container.endConversation.execute(user.id, params.id, new Date());
+
+    return { status: 200, body: toConversationSummary(conversation) };
+  },
+});
+
+export const deleteConversation = defineHandler({
+  operationId: "deleteConversation",
+  method: "delete",
+  path: "/api/conversations/{id}",
+  summary: "Delete a conversation",
+  description:
+    "Erases the conversation and every turn in it. Not idempotent - a second delete answers 404, because by then the row genuinely is gone. The audit rows recording that a realtime credential was minted and which tools ran are NOT erased; only the words are.",
+  tags: ["conversations"],
+  requiresAuth: true,
+  params: conversationIdParams,
+  responses: { 204: null, 401: errorEnvelope, 404: errorEnvelope },
   handler: async ({ context, params }) => {
     const user = currentUser(context);
 
-    const conversation = await container.endConversation.execute(
-      user.id,
-      params.id,
-      new Date(),
-    );
+    await container.deleteConversation.execute(user.id, params.id);
 
-    return { status: 200, body: toConversationSummary(conversation) };
+    // 204, not 200 with a body: there is nothing left to describe.
+    return { status: 204 };
   },
 });
 

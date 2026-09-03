@@ -1,9 +1,10 @@
 # Convo AI — Design & Build Plan
 
-**Status:** design agreed 20 Aug 2026. **Iterations 0–5 are built** — the backend, the
-Expo app, and real WebRTC audio on the Note 8 (iteration 5's exit test needs a human
-voice and is still open; see `HANDOFF.md`). Iteration 6 (transcript persistence and
-history) is next.
+**Status:** design agreed 20 Aug 2026. **Iterations 0–6 are built** — the backend, the
+Expo app, real WebRTC audio on the Note 8, and conversation persistence with a
+searchable history sidebar (verified on the device 3 Sep 2026). Iteration 5's exit
+test needs a human voice and is still open; see `HANDOFF.md`. Iteration 7
+(hardening and measured latency) is next.
 **Read order:** `CLAUDE.md` (rules) → this file (design) → `HANDOFF.md` (verified facts, gotchas).
 
 > Two parts of this file describe a design that iteration 1 deliberately
@@ -507,15 +508,24 @@ doing the job it was chosen for.
 
 ---
 
-### Iteration 6 — Transcripts, persistence, history
+### Iteration 6 — Transcripts, persistence, history — **BUILT 3 Sep 2026**
 
 Data-channel events → the transcript under the orb, per-word fade via the native
 `streamingAnimation`. Completed turns → `POST /turns` with monotonic `seq` and
 retry-on-same-seq. Sidebar lists real conversations from `GET /api/conversations`;
 tapping one opens its transcript.
 
+Built beyond the original plan, at the user's request: **rename** and **delete**
+a chat, and **search** across titles and turn text via `GET /api/conversations?q=`.
+See `HANDOFF.md` for why `seq` is a position rather than a counter, why the PATCH
+body is a union, and why search had to be server-side.
+
 **Exit test:** hold a real multi-turn conversation, hang up, reopen it from the
 sidebar, and confirm the stored transcript matches what was said.
+**Status:** the machinery is verified on the Note 8 — a real call stored both its
+turns, the first user turn titled the conversation (`"Hello."`), the row is listed,
+and searching `today` finds it by the assistant's turn text alone. A longer
+multi-turn read-back is still worth doing by hand.
 
 ---
 

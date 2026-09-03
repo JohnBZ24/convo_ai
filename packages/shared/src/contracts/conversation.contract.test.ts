@@ -2,9 +2,14 @@ import { describe, expect, it } from "vitest";
 import { paginationQuery } from "./common.contract";
 import {
   appendTurnBody,
+  CONVERSATION_SEARCH_MAX_LENGTH,
+  CONVERSATION_TITLE_MAX_LENGTH,
+  conversationListQuery,
   conversationSummary,
   endConversationBody,
+  renameConversationBody,
   TURN_TEXT_MAX_LENGTH,
+  updateConversationBody,
 } from "./conversation.contract";
 
 /**
@@ -76,6 +81,94 @@ describe("endConversationBody", () => {
   /** A finished conversation does not reopen. */
   it("refuses to reactivate a conversation", () => {
     expect(endConversationBody.safeParse({ status: "active" }).success).toBe(false);
+  });
+});
+
+describe("conversationListQuery", () => {
+  it("treats an absent q as 'list everything'", () => {
+    expect(conversationListQuery.parse({})).toEqual({ limit: 20 });
+  });
+
+  it("keeps the pagination it extends", () => {
+    expect(conversationListQuery.parse({ limit: "50", q: "dentist" })).toEqual({
+      limit: 50,
+      q: "dentist",
+    });
+  });
+
+  it("trims, because a phone keyboard adds a trailing space constantly", () => {
+    expect(conversationListQuery.parse({ q: "  dentist  " }).q).toBe("dentist");
+  });
+
+  /**
+   * An empty q must NOT quietly mean "everything". `%%` matches every row, and
+   * a search that silently becomes a full history dump is the exact failure
+   * this API guards against on the model's side of the same predicate.
+   */
+  it("rejects an empty q rather than treating it as no filter", () => {
+    expect(conversationListQuery.safeParse({ q: "" }).success).toBe(false);
+    expect(conversationListQuery.safeParse({ q: "   " }).success).toBe(false);
+  });
+
+  it("bounds the term, so a scan cannot be handed a novel", () => {
+    const tooLong = "x".repeat(CONVERSATION_SEARCH_MAX_LENGTH + 1);
+    expect(conversationListQuery.safeParse({ q: tooLong }).success).toBe(false);
+  });
+});
+
+describe("renameConversationBody", () => {
+  it("takes the title the user typed", () => {
+    expect(renameConversationBody.parse({ title: "Dentist" })).toEqual({
+      title: "Dentist",
+    });
+  });
+
+  /** Surrounding space is the user's typing, not part of what they meant. */
+  it("trims before it validates", () => {
+    expect(renameConversationBody.parse({ title: "  Dentist  " }).title).toBe(
+      "Dentist",
+    );
+  });
+
+  /**
+   * A whitespace-only title would draw as a blank sidebar row that cannot be
+   * told apart from a broken one, so it is rejected rather than stored.
+   */
+  it("rejects a title that is empty once trimmed", () => {
+    expect(renameConversationBody.safeParse({ title: "   " }).success).toBe(false);
+    expect(renameConversationBody.safeParse({ title: "" }).success).toBe(false);
+  });
+
+  it("caps it at the same length as a derived title", () => {
+    const tooLong = "x".repeat(CONVERSATION_TITLE_MAX_LENGTH + 1);
+    expect(renameConversationBody.safeParse({ title: tooLong }).success).toBe(false);
+  });
+
+  /** There is no "make this untitled again" - null is a server-side state. */
+  it("does not accept null", () => {
+    expect(renameConversationBody.safeParse({ title: null }).success).toBe(false);
+  });
+});
+
+describe("updateConversationBody", () => {
+  it("accepts either intent", () => {
+    expect(updateConversationBody.safeParse({ title: "Dentist" }).success).toBe(true);
+    expect(updateConversationBody.safeParse({ status: "ended" }).success).toBe(true);
+  });
+
+  /**
+   * The reason this is a union rather than two optional fields: an empty body
+   * is rejected by the SCHEMA, which JSON Schema can express, rather than by a
+   * refinement that would vanish from the published document.
+   */
+  it("rejects a PATCH that asks for nothing", () => {
+    expect(updateConversationBody.safeParse({}).success).toBe(false);
+  });
+
+  it("reads a body carrying both as a rename, which is the declared order", () => {
+    const parsed = updateConversationBody.parse({ title: "Dentist", status: "ended" });
+
+    expect(parsed).toEqual({ title: "Dentist" });
   });
 });
 

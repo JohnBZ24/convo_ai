@@ -13,6 +13,16 @@ export type { TranscriptLine };
 
 interface TranscriptProps {
   lines: readonly TranscriptLine[];
+  /**
+   * Whether these lines are still arriving.
+   *
+   * A live call pins to the bottom and fades each word in as it is spoken. A
+   * conversation read back from the server is finished: it opens at the START,
+   * because someone reopening it wants to read from the beginning, and it does
+   * not animate - a stored reply revealing itself word by word would pretend
+   * to be happening now.
+   */
+  live?: boolean;
 }
 
 /**
@@ -27,7 +37,7 @@ interface TranscriptProps {
  * and rendering through it here is what proves Bundle Mode actually works on
  * the device rather than merely being configured.
  */
-function TranscriptComponent({ lines }: TranscriptProps) {
+function TranscriptComponent({ lines, live = true }: TranscriptProps) {
   /** Two frozen style objects rather than one built per row - this list re-renders per token. */
   const styleFor = useMemo(
     () => ({
@@ -47,12 +57,12 @@ function TranscriptComponent({ lines }: TranscriptProps) {
            * Native, and animates only the newly appended tail - which is why
            * the per-word fade costs nothing as the transcript grows.
            */
-          streamingAnimation={item.role === "assistant"}
+          streamingAnimation={live && item.role === "assistant"}
           selectable={false}
         />
       </View>
     ),
-    [styleFor],
+    [styleFor, live],
   );
 
   return (
@@ -67,10 +77,11 @@ function TranscriptComponent({ lines }: TranscriptProps) {
        * behaviour. Do NOT add an onScroll handler to reimplement it - a JS-side
        * handler would fight this one and stutter under load.
        */
-      maintainVisibleContentPosition={{
-        autoscrollToBottomThreshold: 0.2,
-        startRenderingFromBottom: true,
-      }}
+      maintainVisibleContentPosition={
+        live
+          ? { autoscrollToBottomThreshold: 0.2, startRenderingFromBottom: true }
+          : undefined
+      }
     />
   );
 }

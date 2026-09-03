@@ -71,6 +71,28 @@ export class Conversation extends BaseEntity {
   }
 
   /**
+   * Retitle it. The one piece of a conversation the user edits directly.
+   *
+   * Unlike `end`, this does NOT care about status: a finished conversation is
+   * exactly the one a user scrolls back to and renames, so refusing it would
+   * make the feature useless for everything but the call in progress.
+   */
+  rename(title: string): Conversation {
+    if (title === this.title) return this;
+
+    return new Conversation({
+      id: this.id,
+      userId: this.userId,
+      title,
+      status: this.status,
+      turnCount: this.turnCount,
+      lastTurnAt: this.lastTurnAt,
+      startedAt: this.startedAt,
+      endedAt: this.endedAt,
+    });
+  }
+
+  /**
    * A conversation is titled by what the USER said first - never by the
    * assistant, whose opening line is usually a greeting and says nothing about
    * the conversation.

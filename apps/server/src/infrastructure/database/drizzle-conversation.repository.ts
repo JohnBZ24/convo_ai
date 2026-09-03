@@ -43,6 +43,39 @@ function escapeLikePattern(query: string): string {
   return query.replace(/\\/g, "\\\\").replace(/[%_]/g, "\\$&");
 }
 
+/**
+ * "This conversation mentions `query`" - the predicate BOTH the sidebar's
+ * search box and the model's `search_conversations` tool are built on.
+ *
+ * Extracted rather than written twice, because the two would drift: the one a
+ * person uses would gain a fix that the one a model uses did not, and the
+ * difference would only show up as "the assistant cannot find a conversation I
+ * can see".
+ *
+ * EXISTS rather than a JOIN + DISTINCT: a conversation with forty matching
+ * turns should appear once, and EXISTS stops at the first hit instead of
+ * building every matching pair only to collapse them again.
+ *
+ * KNOWN LIMITATION: `ilike` cannot use a b-tree index, so this scans the
+ * user's turns. Correct at this size and honest about it - the fix when it
+ * matters is a tsvector column with a GIN index, which is a migration and a
+ * change to this one function. See docs/HANDOFF.md.
+ */
+function matchesQuery(database: Database, query: string) {
+  const pattern = `%${escapeLikePattern(query)}%`;
+
+  const mentionedInATurn = exists(
+    database
+      .select({ matched: sql`1` })
+      .from(turns)
+      .where(
+        and(eq(turns.conversationId, conversations.id), ilike(turns.text, pattern)),
+      ),
+  );
+
+  return or(ilike(conversations.title, pattern), mentionedInATurn);
+}
+
 function toTurn(row: TurnRow): Turn {
   return Turn.fromPersistence({
     id: row.id,
@@ -125,12 +158,22 @@ export class DrizzleConversationRepository implements ConversationRepository {
       ? sql`(${conversations.startedAt}, ${conversations.id}) < (${after.startedAt.toISOString()}::timestamptz, ${after.id}::uuid)`
       : undefined;
 
+    /**
+     * The search term joins the SAME where clause as the keyset. Filtering a
+     * fetched page in JS instead would break pagination outright: 30 rows might
+     * hold two matches, and "load more" would page through history the user
+     * cannot see.
+     */
+    const matching = options.query
+      ? matchesQuery(this.database, options.query)
+      : undefined;
+
     // One row more than asked for: its existence is the entire "is there a
     // next page?" answer, and it costs nothing extra on an index scan.
     const rows = await this.database
       .select()
       .from(conversations)
-      .where(and(eq(conversations.userId, userId), keyset))
+      .where(and(eq(conversations.userId, userId), keyset, matching))
       .orderBy(desc(conversations.startedAt), desc(conversations.id))
       .limit(limit + 1);
 
@@ -144,27 +187,6 @@ export class DrizzleConversationRepository implements ConversationRepository {
     userId: string,
     options: SearchConversationsOptions,
   ): Promise<Conversation[]> {
-    const pattern = `%${escapeLikePattern(options.query)}%`;
-
-    /**
-     * EXISTS rather than a JOIN + DISTINCT: a conversation with forty matching
-     * turns should appear once, and EXISTS stops at the first hit instead of
-     * building every matching pair only to collapse them again.
-     *
-     * KNOWN LIMITATION: `ilike` cannot use a b-tree index, so this scans the
-     * user's turns. Correct at this size and honest about it - the fix when it
-     * matters is a tsvector column with a GIN index, which is a migration and a
-     * change to this one method. See docs/HANDOFF.md.
-     */
-    const mentionedInATurn = exists(
-      this.database
-        .select({ matched: sql`1` })
-        .from(turns)
-        .where(
-          and(eq(turns.conversationId, conversations.id), ilike(turns.text, pattern)),
-        ),
-    );
-
     const rows = await this.database
       .select()
       .from(conversations)
@@ -172,7 +194,7 @@ export class DrizzleConversationRepository implements ConversationRepository {
         and(
           // Ownership in the predicate, as everywhere else in this class.
           eq(conversations.userId, userId),
-          or(ilike(conversations.title, pattern), mentionedInATurn),
+          matchesQuery(this.database, options.query),
         ),
       )
       .orderBy(desc(conversations.startedAt), desc(conversations.id))
@@ -201,6 +223,41 @@ export class DrizzleConversationRepository implements ConversationRepository {
     // Either it was already ended - answer with the original timestamp - or it
     // is not this user's, in which case this returns null too.
     return this.findById(userId, id);
+  }
+
+  async rename(
+    userId: string,
+    id: string,
+    title: string,
+  ): Promise<Conversation | null> {
+    const [row] = await this.database
+      .update(conversations)
+      .set({ title })
+      .where(and(eq(conversations.id, id), eq(conversations.userId, userId)))
+      .returning();
+
+    // No row means no such conversation OF THIS USER - the ownership term is
+    // in the UPDATE's own predicate, so a stranger's row is never touched and
+    // never read back to tell them it exists.
+    return row ? toConversation(row) : null;
+  }
+
+  async delete(userId: string, id: string): Promise<boolean> {
+    /**
+     * `returning({ id })` rather than counting affected rows: postgres.js
+     * reports a count, but reading it back through Drizzle's result shape
+     * differs by driver, while a returned row is the same everywhere.
+     *
+     * The turns go with this by ON DELETE CASCADE, declared on the turns table.
+     * Deleting them here in a transaction would be the same work said twice,
+     * and the version the database enforces is the one that cannot be skipped.
+     */
+    const rows = await this.database
+      .delete(conversations)
+      .where(and(eq(conversations.id, id), eq(conversations.userId, userId)))
+      .returning({ id: conversations.id });
+
+    return rows.length > 0;
   }
 
   async appendTurn(

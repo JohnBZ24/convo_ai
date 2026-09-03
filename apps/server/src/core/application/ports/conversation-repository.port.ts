@@ -21,6 +21,19 @@ export interface ListConversationsOptions {
   limit: number;
   /** Exclusive: return rows strictly after this position in the ordering. */
   after: KeysetPosition | null;
+  /**
+   * The sidebar's search box. Null lists everything.
+   *
+   * Filtering happens INSIDE the same query as the keyset predicate, not by
+   * fetching a page and sieving it afterwards - otherwise a page of 30 rows
+   * could yield two matches and the user would have to scroll to find the
+   * rest of them.
+   *
+   * Text the USER typed rather than the model, so it is not hostile in the way
+   * `SearchConversationsOptions.query` is - but the implementation escapes LIKE
+   * metacharacters just the same, because "50%" is a thing a person types.
+   */
+  query: string | null;
 }
 
 export interface ConversationPage {
@@ -78,6 +91,22 @@ export interface ConversationRepository {
    * Already-ended conversations are returned unchanged - see Conversation.end.
    */
   end(userId: string, id: string, at: Date): Promise<Conversation | null>;
+
+  /** Sets the title the user chose. Null when it is not this user's. */
+  rename(userId: string, id: string, title: string): Promise<Conversation | null>;
+
+  /**
+   * Removes the conversation and, by cascade, every turn in it. False when
+   * there was nothing of this user's to remove - which is also the answer for
+   * someone else's conversation, so a probe learns nothing from the result.
+   *
+   * The audit rows in `realtime_sessions` and `tool_invocations` SURVIVE: their
+   * foreign keys are ON DELETE SET NULL, so a deleted conversation still leaves
+   * the record that a credential was minted and what tools ran. Deleting a
+   * chat is the user erasing their words, not erasing the fact that a session
+   * happened.
+   */
+  delete(userId: string, id: string): Promise<boolean>;
 
   /**
    * Conversations of THIS user matching `query`, newest first.

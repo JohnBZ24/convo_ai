@@ -64,8 +64,8 @@ even where the code had to be rewritten.
 | 3 | `packages/ai` + realtime token route + guarded tools endpoint | **DONE** |
 | 4 | Expo app scaffold + UI shell + FIRST dev build on the Note 8 | **DONE** |
 | 5 | WebRTC audio on a real device | **BUILT + 2 device bugs fixed 3 Sep** — self-interruption test still open |
-| 6 | Transcripts, persistence, history screen | Next |
-| 7 | Hardening + measured latency over USB | |
+| 6 | Transcripts, persistence, history screen | **DONE 3 Sep, verified on the Note 8** - plus rename, delete and search |
+| 7 | Hardening + measured latency over USB | Next |
 
 ## State as of 20 Aug 2026 (sessions 2-3)
 
@@ -634,6 +634,179 @@ room. Status after session 5:
 
 Everything up to the point where a human has to speak is verified above.
 
+### What iteration 6 actually built
+
+Turn persistence, a real sidebar, and the three things a person does to a chat:
+open it, rename it, delete it - plus search. Verified on the Note 8 at 12:26 on
+3 Sep, not inferred.
+
+**`POST /api/conversations/:id/turns` finally has a caller.** It existed since
+iteration 2 and nothing had ever called it; every conversation in Postgres read
+`turn_count = 0, title = null`. The device now posts each line as it completes,
+and the first user turn names the conversation server-side.
+
+#### `seq` is a POSITION, not a counter - and that is the whole design
+
+`features/call/turn-recorder.ts` assigns `seq` from the line's slot index in the
+assembler's order, 1-based. Not from a counter, and this is not a stylistic
+choice:
+
+- Input transcription is ASYNCHRONOUS. The model's reply finishes before the
+  user's own words are transcribed - that is why `input_audio_buffer.committed`
+  is handled at all. A counter incremented on each `*.transcript.done` would
+  therefore number the REPLY 1 and the QUESTION 2, and the stored conversation
+  would read backwards. `turn-recorder.test.ts` asserts exactly this ordering.
+- A position is STABLE. The same line always computes the same seq, so a retry
+  collides with the unique index on `(conversation_id, seq)` and is answered
+  `replayed: true` rather than storing the sentence twice. A counter cannot do
+  that: whether it was incremented before a failed request is precisely what a
+  dropped response cannot tell you.
+
+The recorder posts serially with a `[500, 2000, 5000]ms` backoff, dedupes by seq
+locally, and NEVER throws - a turn that will not store is a missing line in a
+history screen, while an unhandled rejection mid-sentence is a crash. Empty and
+whitespace-only transcripts are dropped before they are posted: the VAD commits
+coughs and doors, and the server 422s an empty `text`, so posting one would burn
+three retries to store a blank row.
+
+#### PATCH carries two intents, as a union
+
+`PATCH /api/conversations/{id}` now accepts `{ title }` OR `{ status: "ended" }`,
+declared as `z.union([renameConversationBody, endConversationBody])` rather than
+one object with two optional fields. The reason is the published document: a
+union makes both intents visible as named `$defs` under `anyOf`, and `{}` is
+rejected BY THE SCHEMA - a `.refine()` would enforce it at runtime and vanish
+from the OpenAPI output. Rename is listed first, so a body carrying both is read
+as a rename; nothing sends both, the order is there so the answer is defined.
+
+The controller branches on `"title" in body`. That is the one branch in
+`conversations.controller.ts`, and it is deciding what the REQUEST MEANS, which
+is presentation's job - not what should happen, which is the use case's.
+
+#### DELETE erases the words, not the audit trail
+
+`DELETE /api/conversations/{id}` gives 204, and a second one gives **404**.
+Deliberately NOT idempotent, unlike `end`: ending is fired by the device as a
+call tears down and must survive a retry, while deleting is a person tapping once
+and by the second attempt the row genuinely is gone.
+
+Turns go by `ON DELETE CASCADE`, already declared on the turns table. The
+`realtime_sessions` and `tool_invocations` rows are `ON DELETE SET NULL` and
+SURVIVE - deleting a chat is the user erasing their words, not erasing the record
+that a session happened and what tools ran.
+
+#### Search: one endpoint with a filter, not a second endpoint
+
+`GET /api/conversations?q=...`. The term joins the SAME `WHERE` clause as the
+keyset cursor, so a search pages exactly like an unfiltered list.
+
+- **Filtering a fetched page in JS would break "load more" outright.** Thirty
+  rows might hold two matches and the rest would be unreachable. Verified live:
+  `q=the&limit=1` returned three single-row pages and correctly skipped three
+  non-matching conversations in between.
+- **It searches TURN TEXT, which is the entire reason it is server-side.** The
+  device has titles; the words only exist in Postgres. Proved on the phone: the
+  conversation titled `"Hello."` is returned by searching `today`, because the
+  assistant said "What can I do for you today?". A client-side title filter shows
+  "No chats match that" for that query.
+- **`%` matches NOTHING.** `escapeLikePattern` now guards the user's box as well
+  as the model's tool, and an empty `q` is a 422 rather than a silent "match
+  all" - the same failure this API already refuses on the model's side.
+
+`matchesQuery()` in `drizzle-conversation.repository.ts` is shared by `list` and
+by the `search_conversations` tool. Written twice they would drift, and the
+symptom is nasty: "the assistant cannot find a conversation I can see."
+
+#### The drawer moved, and it was not tidiness
+
+`components/sidebar.tsx` is now ONLY the gesture shell. The contents live in
+`features/conversations/conversation-list.tsx`, which fetches its own data.
+
+The voice screen re-renders on every `activity` change - several times a
+sentence. With the search term or the query result held up there, every keystroke
+and every refetch would reconcile the whole drawer panel behind the next tap,
+which is the exact problem iteration 4 measured and fixed with `edgeWidth` and
+memoisation. `renderNavigationView` now depends on three callbacks that never
+change.
+
+Other things in there worth not re-deriving:
+
+- **`useMemo` on the flattened page list is load-bearing**, not a
+  micro-optimisation: `pages.flatMap()` returns a fresh array identity per
+  render and would defeat `memo(Sidebar)` on its own.
+- **`RowEditor` is a separate component so it MOUNTS when renaming starts.** A
+  `useState` initialiser runs once per mount, so a draft held by the
+  always-mounted row would hold whatever the title was when the drawer first
+  rendered - empty, for a conversation untitled until its first turn landed.
+- **Rename and delete use `setQueriesData`, plural.** Each search term is its own
+  cache entry under the `["conversations","list"]` prefix, so a singular
+  `setQueryData` on the prefix matches NONE of them and the row keeps its old
+  title in whichever list the user was not looking at.
+- **Submitting a rename also blurs it**, so both handlers fire; `RowEditor` has a
+  `committed` ref that makes the second a no-op rather than a second PATCH.
+
+#### `URLSearchParams` is a stub in React Native
+
+Building the list query string by hand is deliberate. RN's polyfill throws "not
+implemented" for `set`, `get` and `delete`, and has no `size`. Node has the real
+thing, so a test written against it passes while the device throws - the same
+"curl is not a phone" trap as the two bugs in session 5. Search terms go through
+`encodeURIComponent`, or an `&` in what someone typed rewrites the query string.
+
+#### Expo bundles the JS at the START of a release build
+
+Two APKs were built before this was noticed. `expo run:android --variant release`
+writes the bundle in the first ~30 seconds and Gradle packages it minutes later,
+so **any source edited after the build starts is silently absent from the APK**
+while the build still reports success. The log line to check is
+`Android Bundled ... Writing bundle output to: ...index.android.bundle` - compare
+its time against `stat` on the source, not the APK's mtime.
+
+`--no-bundler` does NOT stop Metro starting; the run still prints
+`Waiting on http://localhost:8081` and tries a dev-client deep link. Harmless for
+a release build, which loads its embedded bundle, but it is not evidence of
+anything.
+
+#### Verified on the device, 3 Sep 12:26-12:28
+
+Release APK bundled 12:04, installed 12:25:51.
+
+```
+drawer            "New chat", a "Search chats" box, one row: "Hello."
+                  <- a DERIVED title, so a turn was persisted and named it
+q="hello"         row stays          (case-insensitive)
+q="hellozzq"      "No chats match that"
+cleared           row returns
+q="today"         row stays          <- title has no "today"; the TURN does
+```
+
+Postgres afterwards, for that conversation:
+
+```
+baroud3@gmail.com  "Hello."  1 user      | Hello.
+baroud3@gmail.com  "Hello."  2 assistant | Hi there! What can I do for you today?
+```
+
+Server surface, probed live against real Postgres before the app was touched:
+
+```
+POST /turns seq 1            201
+POST /turns seq 1 again      200   (replayed, turn_count unmoved)
+PATCH {"title":"  x  "}      200   stored trimmed
+PATCH {}                     422
+PATCH {"status":"ended"}     200
+DELETE                       204
+DELETE again                 404
+GET after delete             404
+q=dentist                    title match
+q=boiler                     TURN match (title was "hello there")
+q=%                          no rows
+q= (empty)                   422
+q=101 chars                  422
+```
+
+Tests after iteration 6: **142 server, 78 mobile, 41 shared, 24 ai, 8 db**.
+
 ### The demo runbook
 
 Cable is needed ONCE to install. After that the phone is on Wi-Fi only.
@@ -848,28 +1021,47 @@ wastes a session chasing it.
   but `15.0.2` works on 57 — its peer range is `expo: ">=56"`. It adds `CAMERA`
   unconditionally, which `android.blockedPermissions` removes.
 
-### Where iteration 6 starts
+### Where iteration 7 starts
 
-Audio is real and now actually comes out of the loudspeaker; nothing is stored yet.
+Audio is real, it comes out of the loudspeaker, and conversations are now stored,
+listed, searched, renamed, deleted and read back. Iteration 6 is closed.
 
-**Do this first, before any iteration 6 code:** talk to the phone and confirm the
-model does not interrupt itself. It is a two-minute test, it is the exit criterion
-for iteration 5, and it has never once been run under conditions where it could
-fail honestly — see item 2 under *What is NOT yet verified*.
+**Two things from earlier iterations are still open, and both need a person.**
+Neither is code:
 
-- **`POST /api/conversations/:id/turns` has no caller.** The transcript lives in
-  `useCallSession`'s React state and dies with the screen. The assembler already
-  keys every line by OpenAI's `item_id` and knows when a line is final
-  (`input.transcript.done` / `output.transcript.done`), which is the natural point
-  to assign a monotonic `seq` and post it.
-- **The sidebar list is `useMemo(() => [], [])`.** It wants
-  `GET /api/conversations`, and TanStack Query is already wired in `_layout.tsx`
-  with zero `useQuery` calls so far.
-- **Nothing reads a conversation back.** `GET /api/conversations/{id}` returns the
-  turns; there is no screen for them.
-- The per-word fade is native and already available -
-  `react-native-enriched-markdown`'s `streamingAnimation`, which `transcript.tsx`
-  already passes for assistant lines.
+1. **The self-interruption test.** Talk to the phone and confirm the model does
+   not cut itself off while its own voice is in the room. It is the exit
+   criterion for ITERATION 5 and it has still never been run under conditions
+   where it could fail honestly - see item 2 under *What is NOT yet verified*.
+   Every "no self-interruption" observation before the 3 Sep build is void,
+   because the audio was coming out of the earpiece.
+2. **Tool calls end to end.** `get_current_time` (device) and
+   `search_conversations` (proxied) have never been exercised from a real call.
+   The proxied one is now genuinely worth testing: before iteration 6 every
+   conversation was empty, so the tool could only ever have returned nothing.
+
+Then iteration 7 proper - barge-in, credential expiry mid-call, reconnect after
+network loss, offline state, real error surfaces - and the measurement table in
+`DESIGN.md` filled in with real Note 8 numbers rather than claims.
+
+Known gaps left deliberately in iteration 6:
+
+- **Search is `ilike`, so it scans the user's turns.** Correct at this size and
+  honest about it. The fix when it matters is a `tsvector` column with a GIN
+  index: one migration and one function, `matchesQuery()` in
+  `drizzle-conversation.repository.ts`.
+- **The history screen is read-only.** A finished conversation is a record, not
+  somewhere to resume; talking always opens a NEW conversation. That is a design
+  decision, not an omission.
+- **A conversation is only listed after the call ends.** The sidebar is
+  invalidated once the recorder has drained, so the row appears with its derived
+  title rather than appearing untitled and renaming itself under the user.
+- **`.expo/types/router.d.ts` lists files outside `src/app` as routes** (server
+  use-cases, `turn-recorder`, `native-cookie`). Pre-existing typegen noise, extra
+  union members only, harmless - but do not be alarmed by it.
+- Navigation to a conversation must use the OBJECT href form,
+  `router.push({ pathname: "/conversation/[id]", params: { id } })`. With typed
+  routes an interpolated path does not typecheck against the route literal.
 
 ## The API as built
 
@@ -883,13 +1075,14 @@ All of it exists now. Kept as the one-page map of the surface.
 | `GET /api/ready` | Readiness. `checkConnection` on a 2s timeout, 503 + `degraded` when the DB is down. |
 | `GET /api/openapi`, `GET /api/docs` | Gated on `DOCS_ENABLED`, else 404. |
 | `POST /api/auth/$` | Bare splat delegating to Better Auth's own handler. **Deliberately not wrapped in `handler()`.** |
-| `POST/GET /api/conversations` | Create (201) and list (keyset paginated). |
-| `GET/PATCH /api/conversations/:id` | Detail and end. |
+| `POST/GET /api/conversations` | Create (201) and list (keyset paginated). `?q=` searches titles AND turn text. |
+| `GET/PATCH/DELETE /api/conversations/:id` | Detail; rename or end (union body); delete 204, second delete 404. |
 | `POST /api/conversations/:id/turns` | Record a turn. 201 new / 200 replayed. |
 | `POST /api/realtime/token` | Mint credential. Rate limited 20/hour/user. |
 | `POST /api/tools/:name` | Execute a privileged tool. Rate limited 120/min/user. |
 
-Every row is DONE as of iteration 3.
+Every row was DONE as of iteration 3; the conversations rows gained search,
+rename and delete in iteration 6.
 
 Still outstanding from the pre-loss code: `security.ts` (recovered — see the
 backup folder) was never reinstated, because iteration 1 wrote

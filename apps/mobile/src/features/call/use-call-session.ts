@@ -1,6 +1,12 @@
+import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useAuthStore } from "~/features/auth/auth-store";
-import { createConversation, endConversation } from "~/lib/api/conversations";
+import { conversationKeys } from "~/features/conversations/use-conversations";
+import {
+  appendTurn,
+  createConversation,
+  endConversation,
+} from "~/lib/api/conversations";
 import { mintRealtimeCredential, postRealtimeOffer } from "~/lib/api/realtime";
 import { executeTool } from "~/lib/api/tools";
 import { useLiveAmplitude } from "./amplitude";
@@ -16,6 +22,7 @@ import {
   type TranscriptState,
   visibleLines,
 } from "./transcript-assembler";
+import { completedTurn, TurnRecorder } from "./turn-recorder";
 import {
   createRealtimePeerConnection,
   deviceTimeZone,
@@ -44,11 +51,26 @@ export function useCallSession(): readonly TranscriptLine[] {
   const fail = useCallStore((state) => state.fail);
   const token = useAuthStore((state) => state.token);
 
+  const queryClient = useQueryClient();
+
   const [transcript, setTranscript] = useState<TranscriptState>(emptyTranscript);
 
   const sessionRef = useRef<RealtimeSession | null>(null);
   const tokenRef = useRef(token);
   tokenRef.current = token;
+
+  /**
+   * The assembler's state, held OUTSIDE React as well as in it.
+   *
+   * `completedTurn` needs the state after the event has been reduced, and a
+   * `setState` updater is the wrong place to ask for it: updaters have to be
+   * pure and React may run one twice. Reducing here and pushing the result into
+   * state keeps the updater trivial and gives the recorder the value it needs.
+   */
+  const transcriptRef = useRef<TranscriptState>(emptyTranscript);
+
+  /** Posts completed turns. Built once the conversation id is known. */
+  const recorderRef = useRef<TurnRecorder | null>(null);
 
   /** Function calls already answered. `response.done` can repeat one. */
   const answered = useRef(new Set<string>());
@@ -81,7 +103,22 @@ export function useCallSession(): readonly TranscriptLine[] {
 
   const onEvent = useCallback(
     (event: RealtimeEvent) => {
-      setTranscript((state) => reduceTranscript(state, event));
+      const next = reduceTranscript(transcriptRef.current, event);
+      if (next !== transcriptRef.current) {
+        transcriptRef.current = next;
+        setTranscript(next);
+      }
+
+      /**
+       * Where the transcript stops being ephemeral. A line that has just
+       * finished gets its seq from its POSITION in `next` and goes to the
+       * server; everything else about the call is unchanged.
+       *
+       * Not awaited: the recorder has its own queue and its own retries, and a
+       * live call must not wait on the network to carry on listening.
+       */
+      const turn = completedTurn(next, event);
+      if (turn) void recorderRef.current?.record(turn);
 
       switch (event.type) {
         case "speech.started":
@@ -121,10 +158,38 @@ export function useCallSession(): readonly TranscriptLine[] {
   const onEventRef = useRef(onEvent);
   onEventRef.current = onEvent;
 
+  /**
+   * The data channel is open, so the call is live AND the conversation id is
+   * known - which is the earliest moment a turn could be posted, and therefore
+   * the right moment to build the thing that posts them.
+   *
+   * The token is read per request rather than captured here, for the same
+   * reason as everywhere else in this file: a refresh mid-call must not leave
+   * the recorder holding a stale one.
+   */
+  const onReady = useCallback(
+    (conversationId: string) => {
+      recorderRef.current = new TurnRecorder({
+        post: (turn) => {
+          const bearer = tokenRef.current;
+          if (!bearer) throw new Error("Not signed in");
+          return appendTurn(bearer, conversationId, turn);
+        },
+        log: (message, detail) => {
+          console.log(`[call] ${message}`, detail ?? "");
+        },
+      });
+
+      markReady(conversationId);
+    },
+    [markReady],
+  );
+
   /** Opens a call. Depends on `phase` only - see the note at the top. */
   useEffect(() => {
     if (phase !== "connecting") return undefined;
 
+    transcriptRef.current = emptyTranscript;
     setTranscript(emptyTranscript);
     answered.current = new Set();
 
@@ -166,7 +231,7 @@ export function useCallSession(): readonly TranscriptLine[] {
     };
 
     const session = new RealtimeSession(deps, {
-      onReady: markReady,
+      onReady,
       onEvent: (event) => onEventRef.current(event),
       onFailure: fail,
     });
@@ -175,7 +240,26 @@ export function useCallSession(): readonly TranscriptLine[] {
     void session.open();
 
     return undefined;
-  }, [phase, markReady, fail]);
+  }, [phase, onReady, fail]);
+
+  /**
+   * The last turn of a call finishes at almost the same moment the user taps to
+   * hang up, so its POST is usually still in flight here. Let the recorder
+   * drain, then refresh the sidebar - the list is worth refetching only once
+   * the turn that names the conversation has actually landed.
+   *
+   * Deliberately NOT awaited before `finish()`: a phone on a bad signal can
+   * spend seconds inside the recorder's backoff, and the UI must not sit on
+   * "Ending" for that.
+   */
+  const settleAndRefresh = useCallback(() => {
+    const recorder = recorderRef.current;
+    recorderRef.current = null;
+
+    void (recorder?.drain() ?? Promise.resolve()).finally(() => {
+      void queryClient.invalidateQueries({ queryKey: conversationKeys.lists() });
+    });
+  }, [queryClient]);
 
   /** Closes it. `ending` is the user hanging up; `error` is everything else. */
   useEffect(() => {
@@ -186,6 +270,7 @@ export function useCallSession(): readonly TranscriptLine[] {
 
     if (!session) {
       if (phase === "ending") finish();
+      settleAndRefresh();
       return undefined;
     }
 
@@ -193,16 +278,19 @@ export function useCallSession(): readonly TranscriptLine[] {
       // Only from `ending`. Calling it from `error` would clear the message
       // the user has not read yet.
       if (phase === "ending") finish();
+      settleAndRefresh();
     });
 
     return undefined;
-  }, [phase, finish]);
+  }, [phase, finish, settleAndRefresh]);
 
   /** A backgrounded or unmounted screen must not leave the microphone open. */
   useEffect(() => {
     return () => {
       void sessionRef.current?.close();
       sessionRef.current = null;
+      // The recorder's queue keeps running on its own; only this handle goes.
+      recorderRef.current = null;
     };
   }, []);
 

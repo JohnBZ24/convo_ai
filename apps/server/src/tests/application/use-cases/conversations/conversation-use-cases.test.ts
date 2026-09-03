@@ -2,9 +2,11 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { ApplicationError } from "~/core/application/errors/application-error";
 import { encodeCursor } from "~/core/application/pagination/keyset-cursor";
 import { AppendTurnUseCase } from "~/core/application/use-cases/conversations/append-turn.use-case";
+import { DeleteConversationUseCase } from "~/core/application/use-cases/conversations/delete-conversation.use-case";
 import { EndConversationUseCase } from "~/core/application/use-cases/conversations/end-conversation.use-case";
 import { GetConversationUseCase } from "~/core/application/use-cases/conversations/get-conversation.use-case";
 import { ListConversationsUseCase } from "~/core/application/use-cases/conversations/list-conversations.use-case";
+import { RenameConversationUseCase } from "~/core/application/use-cases/conversations/rename-conversation.use-case";
 import { StartConversationUseCase } from "~/core/application/use-cases/conversations/start-conversation.use-case";
 import { InMemoryConversationRepository } from "~/tests/support/in-memory-conversation.repository";
 
@@ -16,6 +18,8 @@ let start: StartConversationUseCase;
 let list: ListConversationsUseCase;
 let get: GetConversationUseCase;
 let end: EndConversationUseCase;
+let rename: RenameConversationUseCase;
+let remove: DeleteConversationUseCase;
 let append: AppendTurnUseCase;
 
 beforeEach(() => {
@@ -24,6 +28,8 @@ beforeEach(() => {
   list = new ListConversationsUseCase(repository);
   get = new GetConversationUseCase(repository);
   end = new EndConversationUseCase(repository);
+  rename = new RenameConversationUseCase(repository);
+  remove = new DeleteConversationUseCase(repository);
   append = new AppendTurnUseCase(repository);
 });
 
@@ -205,6 +211,239 @@ describe("ending a conversation", () => {
     );
 
     expect(again.endedAt).toEqual(first);
+  });
+});
+
+describe("renaming a conversation", () => {
+  it("replaces a derived title with the one the user chose", async () => {
+    const conversation = await start.execute(OWNER);
+    await append.execute(OWNER, conversation.id, {
+      seq: 1,
+      role: "user",
+      text: "remind me about the dentist",
+      startedAt: null,
+      endedAt: null,
+    });
+
+    const renamed = await rename.execute(OWNER, conversation.id, "Dentist");
+
+    expect(renamed.title).toBe("Dentist");
+  });
+
+  /**
+   * The case that matters: a user renames conversations they scrolled back to,
+   * and every one of those is already ended. Refusing on status would leave the
+   * feature working only for the call in progress.
+   */
+  it("works on an ended conversation, which is the normal case", async () => {
+    const conversation = await start.execute(OWNER);
+    await end.execute(OWNER, conversation.id, new Date());
+
+    const renamed = await rename.execute(OWNER, conversation.id, "Yesterday");
+
+    expect(renamed.title).toBe("Yesterday");
+    expect(renamed.status).toBe("ended");
+  });
+
+  it("does not disturb anything else about it", async () => {
+    const conversation = await start.execute(OWNER);
+    await append.execute(OWNER, conversation.id, {
+      seq: 1,
+      role: "user",
+      text: "hello",
+      startedAt: null,
+      endedAt: null,
+    });
+
+    const renamed = await rename.execute(OWNER, conversation.id, "Greeting");
+
+    expect(renamed.turnCount).toBe(1);
+    expect(renamed.startedAt).toEqual(conversation.startedAt);
+  });
+
+  it("is not found for a stranger", async () => {
+    const conversation = await start.execute(OWNER);
+
+    await expect(
+      rename.execute(STRANGER, conversation.id, "Mine now"),
+    ).rejects.toMatchObject({ kind: "not-found" });
+  });
+
+  it("leaves a stranger's conversation untouched when it refuses", async () => {
+    const conversation = await start.execute(OWNER);
+
+    await expect(rename.execute(STRANGER, conversation.id, "Mine now")).rejects.toThrow(
+      ApplicationError,
+    );
+
+    expect((await get.execute(OWNER, conversation.id)).conversation.title).toBeNull();
+  });
+});
+
+describe("deleting a conversation", () => {
+  it("takes the turns with it", async () => {
+    const conversation = await start.execute(OWNER);
+    await append.execute(OWNER, conversation.id, {
+      seq: 1,
+      role: "user",
+      text: "forget this",
+      startedAt: null,
+      endedAt: null,
+    });
+
+    await remove.execute(OWNER, conversation.id);
+
+    await expect(get.execute(OWNER, conversation.id)).rejects.toMatchObject({
+      kind: "not-found",
+    });
+    expect(await repository.findTurns(conversation.id)).toEqual([]);
+  });
+
+  it("drops it from the list", async () => {
+    const kept = await start.execute(OWNER);
+    const doomed = await start.execute(OWNER);
+
+    await remove.execute(OWNER, doomed.id);
+
+    const page = await list.execute(OWNER, { limit: 10 });
+    expect(page.items.map((c) => c.id)).toEqual([kept.id]);
+  });
+
+  /**
+   * Deliberately NOT idempotent, unlike `end`. Ending is fired by the device as
+   * a call tears down and must survive a retry; deleting is a person tapping
+   * once, and by the second attempt the row really is gone - 404 is the honest
+   * answer rather than a pretence that something was removed.
+   */
+  it("answers not-found the second time, because by then it is gone", async () => {
+    const conversation = await start.execute(OWNER);
+
+    await remove.execute(OWNER, conversation.id);
+
+    await expect(remove.execute(OWNER, conversation.id)).rejects.toMatchObject({
+      kind: "not-found",
+    });
+  });
+
+  it("is not found for a stranger, and does not delete anything", async () => {
+    const conversation = await start.execute(OWNER);
+
+    await expect(remove.execute(STRANGER, conversation.id)).rejects.toMatchObject({
+      kind: "not-found",
+    });
+
+    expect((await get.execute(OWNER, conversation.id)).conversation.id).toBe(
+      conversation.id,
+    );
+  });
+});
+
+describe("searching conversations from the sidebar", () => {
+  async function conversationSaying(...texts: string[]) {
+    const conversation = await start.execute(OWNER);
+    let seq = 0;
+    for (const text of texts) {
+      seq += 1;
+      await append.execute(OWNER, conversation.id, {
+        seq,
+        role: seq === 1 ? "user" : "assistant",
+        text,
+        startedAt: null,
+        endedAt: null,
+      });
+    }
+    return conversation;
+  }
+
+  it("matches the derived title", async () => {
+    const dentist = await conversationSaying("book the dentist for tuesday");
+    await conversationSaying("what is the weather");
+
+    const page = await list.execute(OWNER, { limit: 10, query: "dentist" });
+
+    expect(page.items.map((c) => c.id)).toEqual([dentist.id]);
+  });
+
+  /**
+   * The point of searching the server rather than filtering the loaded page:
+   * the device has titles, but the WORDS are only here. "What was that thing
+   * about the boiler" has to find a conversation called something else.
+   */
+  it("matches something said in a turn the title never mentions", async () => {
+    const boiler = await conversationSaying(
+      "hello there",
+      "the boiler pressure should be about one bar",
+    );
+    await conversationSaying("hello there", "it is sunny");
+
+    const page = await list.execute(OWNER, { limit: 10, query: "boiler" });
+
+    expect(page.items.map((c) => c.id)).toEqual([boiler.id]);
+  });
+
+  it("ignores case", async () => {
+    const dentist = await conversationSaying("book the Dentist");
+
+    const page = await list.execute(OWNER, { limit: 10, query: "DENTIST" });
+
+    expect(page.items.map((c) => c.id)).toEqual([dentist.id]);
+  });
+
+  it("finds nothing rather than everything when nothing matches", async () => {
+    await conversationSaying("book the dentist");
+
+    expect((await list.execute(OWNER, { limit: 10, query: "kayak" })).items).toEqual(
+      [],
+    );
+  });
+
+  it("never reaches across users", async () => {
+    const mine = await conversationSaying("book the dentist");
+    const theirs = await start.execute(STRANGER);
+    await append.execute(STRANGER, theirs.id, {
+      seq: 1,
+      role: "user",
+      text: "book the dentist",
+      startedAt: null,
+      endedAt: null,
+    });
+
+    const page = await list.execute(OWNER, { limit: 10, query: "dentist" });
+
+    expect(page.items.map((c) => c.id)).toEqual([mine.id]);
+  });
+
+  /**
+   * A search is paginated like any other list, and the cursor is issued
+   * against the FILTERED set. Getting this wrong - paging first and filtering
+   * after - would silently hide matches past the first page.
+   */
+  it("pages the matches, not the unfiltered list", async () => {
+    await conversationSaying("dentist one");
+    await conversationSaying("something else entirely");
+    await conversationSaying("dentist two");
+
+    const first = await list.execute(OWNER, { limit: 1, query: "dentist" });
+    expect(first.items).toHaveLength(1);
+    expect(first.nextCursor).not.toBeNull();
+
+    const second = await list.execute(OWNER, {
+      limit: 1,
+      query: "dentist",
+      cursor: first.nextCursor ?? undefined,
+    });
+
+    expect(second.items).toHaveLength(1);
+    expect(second.items[0]?.id).not.toBe(first.items[0]?.id);
+    // Two matches out of three conversations, and no third page of matches.
+    expect(second.nextCursor).toBeNull();
+  });
+
+  it("lists everything when there is no search term", async () => {
+    await conversationSaying("dentist");
+    await conversationSaying("weather");
+
+    expect((await list.execute(OWNER, { limit: 10 })).items).toHaveLength(2);
   });
 });
 

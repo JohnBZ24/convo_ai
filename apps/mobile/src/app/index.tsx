@@ -1,4 +1,5 @@
-import { useCallback, useMemo, useRef } from "react";
+import { useRouter } from "expo-router";
+import { useCallback, useRef } from "react";
 import { StyleSheet, Text, useWindowDimensions, View } from "react-native";
 import { BorderlessButton } from "react-native-gesture-handler";
 import type { DrawerLayoutMethods } from "react-native-gesture-handler/ReanimatedDrawerLayout";
@@ -25,6 +26,7 @@ export default function VoiceScreen() {
   const insets = useSafeAreaInsets();
   const { height } = useWindowDimensions();
   const drawerRef = useRef<DrawerLayoutMethods>(null);
+  const router = useRouter();
 
   /**
    * One selector per field, NOT `useCallStore()` bare.
@@ -109,18 +111,14 @@ export default function VoiceScreen() {
   const orbTop = usableHeight * ORB_CENTRE_FRACTION - ORB_BASE_DIAMETER * 0.8;
 
   /**
-   * Every prop below is stable across renders, on purpose.
+   * All three props below are stable for the life of the screen, on purpose.
    *
-   * `Sidebar` is memoised, and a fresh array or arrow function here would defeat
-   * that on every single render - rebuilding the drawer's whole panel subtree
-   * and putting that work in front of the next tap.
+   * `Sidebar` is memoised, and an arrow function here would defeat that on
+   * every single render - rebuilding the drawer's whole panel subtree and
+   * putting that work in front of the next tap. The conversation data used to
+   * pass through here too; it now lives in `ConversationList`, so a search
+   * keystroke or a refetch does not reach this component at all.
    */
-  /**
-   * Still empty. Real history comes from `GET /api/conversations` in iteration
-   * 6; a hard-coded row here would only be a second thing to delete then.
-   */
-  const conversations = useMemo(() => [], []);
-
   const closeDrawer = useCallback(() => drawerRef.current?.closeDrawer(), []);
 
   /** The transcript belongs to the session now, and clears when one opens. */
@@ -128,12 +126,22 @@ export default function VoiceScreen() {
 
   const onSignOut = useCallback(() => void signOut(), [signOut]);
 
+  const onSelect = useCallback(
+    (id: string) => {
+      closeDrawer();
+      // The object form, not a built string: with typed routes the href is
+      // the ROUTE (`/conversation/[id]`) plus params, and an interpolated
+      // path does not typecheck against it.
+      router.push({ pathname: "/conversation/[id]", params: { id } });
+    },
+    [closeDrawer, router],
+  );
+
   return (
     <Sidebar
       ref={drawerRef}
-      conversations={conversations}
       onNewChat={onNewChat}
-      onSelect={closeDrawer}
+      onSelect={onSelect}
       onSignOut={onSignOut}
     >
       <View

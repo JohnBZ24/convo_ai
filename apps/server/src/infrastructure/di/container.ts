@@ -9,9 +9,11 @@ import type { SessionAuthenticator } from "~/core/application/ports/session-auth
 import type { ToolHandlerRegistry } from "~/core/application/ports/tool-handler.port";
 import type { ToolInvocationRepository } from "~/core/application/ports/tool-invocation-repository.port";
 import { AppendTurnUseCase } from "~/core/application/use-cases/conversations/append-turn.use-case";
+import { DeleteConversationUseCase } from "~/core/application/use-cases/conversations/delete-conversation.use-case";
 import { EndConversationUseCase } from "~/core/application/use-cases/conversations/end-conversation.use-case";
 import { GetConversationUseCase } from "~/core/application/use-cases/conversations/get-conversation.use-case";
 import { ListConversationsUseCase } from "~/core/application/use-cases/conversations/list-conversations.use-case";
+import { RenameConversationUseCase } from "~/core/application/use-cases/conversations/rename-conversation.use-case";
 import { StartConversationUseCase } from "~/core/application/use-cases/conversations/start-conversation.use-case";
 import { CheckLivenessUseCase } from "~/core/application/use-cases/health/check-liveness.use-case";
 import { CheckReadinessUseCase } from "~/core/application/use-cases/health/check-readiness.use-case";
@@ -59,6 +61,8 @@ export interface Dependencies {
   listConversations: ListConversationsUseCase;
   getConversation: GetConversationUseCase;
   endConversation: EndConversationUseCase;
+  renameConversation: RenameConversationUseCase;
+  deleteConversation: DeleteConversationUseCase;
   appendTurn: AppendTurnUseCase;
   mintRealtimeCredential: MintRealtimeCredentialUseCase;
   executeTool: ExecuteToolUseCase;
@@ -134,6 +138,12 @@ export function createContainer(overrides: Partial<Dependencies> = {}): Dependen
       overrides.getConversation ?? new GetConversationUseCase(conversationRepository),
     endConversation:
       overrides.endConversation ?? new EndConversationUseCase(conversationRepository),
+    renameConversation:
+      overrides.renameConversation ??
+      new RenameConversationUseCase(conversationRepository),
+    deleteConversation:
+      overrides.deleteConversation ??
+      new DeleteConversationUseCase(conversationRepository),
     appendTurn: overrides.appendTurn ?? new AppendTurnUseCase(conversationRepository),
     mintRealtimeCredential:
       overrides.mintRealtimeCredential ??
