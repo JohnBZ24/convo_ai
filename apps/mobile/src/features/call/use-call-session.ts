@@ -2,6 +2,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useAuthStore } from "~/features/auth/auth-store";
 import { conversationKeys } from "~/features/conversations/use-conversations";
+import { isOnline } from "~/features/network/network-store";
 import {
   appendTurn,
   createConversation,
@@ -11,8 +12,10 @@ import { mintRealtimeCredential, postRealtimeOffer } from "~/lib/api/realtime";
 import { executeTool } from "~/lib/api/tools";
 import { useLiveAmplitude } from "./amplitude";
 import { beginCallAudio, endCallAudio } from "./audio-route";
+import { ReplyLatency } from "./call-metrics";
 import { useCallStore } from "./call-store";
 import { type DeviceToolDeps, runFunctionCall } from "./device-tools";
+import { describeFailure, isWorthRetrying } from "./failure-message";
 import type { RealtimeEvent, RealtimeFunctionCall } from "./realtime-events";
 import { RealtimeSession, type RealtimeSessionDeps } from "./realtime-session";
 import {
@@ -29,6 +32,35 @@ import {
   openMicrophone,
   requestMicrophonePermission,
 } from "./webrtc-adapter";
+
+/**
+ * How long to wait before each reconnect attempt, and how many there are.
+ *
+ * The first is IMMEDIATE: most drops are already over by the time WebRTC
+ * reports `failed`, so the fastest recovery is to try at once. The rest back
+ * off, because a network that is genuinely down will still be down in 200ms and
+ * a tight loop would only spend battery and credential mints. Four entries, so
+ * a call gives up after roughly twelve seconds of failing to come back.
+ */
+const RECONNECT_DELAYS_MS = [0, 1000, 3000, 8000] as const;
+
+/**
+ * One line, and the detail as a JSON STRING rather than an object.
+ *
+ * `console.log("...", obj)` looks identical in Metro and is unparseable in
+ * logcat: Hermes pretty-prints an object across several lines in JavaScript
+ * syntax - unquoted keys, single-quoted strings - so a release build emits
+ * something that is neither one line nor JSON. `scripts/call-metrics.mjs`
+ * reads these, and stringifying here is what makes them machine-readable at
+ * the only place they are actually collected.
+ *
+ * Nothing passed in carries a transcript or a secret; keep it that way.
+ */
+function logCall(message: string, detail?: Record<string, unknown>): void {
+  console.log(
+    detail ? `[call] ${message} ${JSON.stringify(detail)}` : `[call] ${message}`,
+  );
+}
 
 /**
  * The wiring: call machine <-> transport <-> transcript.
@@ -48,6 +80,7 @@ export function useCallSession(): readonly TranscriptLine[] {
   const markReady = useCallStore((state) => state.markReady);
   const setActivity = useCallStore((state) => state.setActivity);
   const finish = useCallStore((state) => state.finish);
+  const drop = useCallStore((state) => state.drop);
   const fail = useCallStore((state) => state.fail);
   const token = useAuthStore((state) => state.token);
 
@@ -71,6 +104,20 @@ export function useCallSession(): readonly TranscriptLine[] {
 
   /** Posts completed turns. Built once the conversation id is known. */
   const recorderRef = useRef<TurnRecorder | null>(null);
+
+  /**
+   * How long the model takes to start answering after server VAD decides the
+   * user has stopped. The second number in iteration 7's table, and the one a
+   * person actually feels in conversation.
+   */
+  const latencyRef = useRef(new ReplyLatency());
+
+  /**
+   * Consecutive failed reconnects for THIS call. Reset when the connection
+   * genuinely comes back, so a long call over a flaky network keeps recovering,
+   * but a connection that cannot be re-established gives up instead of looping.
+   */
+  const reconnectsRef = useRef(0);
 
   /** Function calls already answered. `response.done` can repeat one. */
   const answered = useRef(new Set<string>());
@@ -122,10 +169,22 @@ export function useCallSession(): readonly TranscriptLine[] {
 
       switch (event.type) {
         case "speech.started":
+          /**
+           * Also the BARGE-IN signal. `interrupt_response: true` is set on the
+           * session, so the model's reply is cancelled server-side; all this
+           * side has to do is stop claiming it is speaking, and forget any
+           * pending latency measurement - the reply that was being timed is
+           * never going to arrive.
+           */
+          latencyRef.current.reset();
           setActivity("listening");
           break;
 
         case "speech.stopped":
+          latencyRef.current.speechStopped();
+          setActivity("thinking");
+          break;
+
         case "response.created":
           setActivity("thinking");
           break;
@@ -135,9 +194,14 @@ export function useCallSession(): readonly TranscriptLine[] {
          * first transcript delta is the earliest honest signal that the model
          * has started speaking.
          */
-        case "output.transcript.delta":
+        case "output.transcript.delta": {
+          // Only the FIRST delta of a reply returns a number; the rest find
+          // nothing pending, which is exactly what makes this the start time.
+          const latencyMs = latencyRef.current.replyStarted();
+          if (latencyMs !== null) logCall("reply latency", { latencyMs });
           setActivity("speaking");
           break;
+        }
 
         case "response.done":
           setActivity("listening");
@@ -180,18 +244,88 @@ export function useCallSession(): readonly TranscriptLine[] {
         },
       });
 
+      /**
+       * The connection is genuinely back, so the budget resets. A call that
+       * survives four separate Wi-Fi blips over half an hour is recovering, not
+       * failing - only CONSECUTIVE failures should give up.
+       */
+      reconnectsRef.current = 0;
+
       markReady(conversationId);
     },
     [markReady],
   );
 
+  /**
+   * A dropped connection, and what to do about it.
+   *
+   * Spaced out rather than hammered: the usual cause is a phone moving between
+   * Wi-Fi cells or a laptop that slept for a second, and the first retry is
+   * immediate because most drops are already over by the time we hear about
+   * them. After that it backs off, because a network that is still down will
+   * still be down 200ms later.
+   */
+  const onDroppedRef = useRef<() => void>(() => undefined);
+
+  const onDropped = useCallback(() => {
+    const session = sessionRef.current;
+    if (!session) return;
+
+    const attempt = reconnectsRef.current;
+    const delay = RECONNECT_DELAYS_MS[attempt];
+
+    if (delay === undefined) {
+      fail("The connection dropped and could not be restored");
+      return;
+    }
+
+    reconnectsRef.current = attempt + 1;
+    // No-op after the first attempt: the phase is already `reconnecting`.
+    drop();
+
+    setTimeout(() => {
+      // The user hung up while we were waiting, or a new call started.
+      if (sessionRef.current !== session) return;
+
+      void session.reconnect().catch((error) => {
+        if (sessionRef.current !== session) return;
+
+        /**
+         * A refused credential or a signed-out session fails identically every
+         * time; retrying it just spends the user's patience before showing the
+         * same message.
+         */
+        if (isWorthRetrying(error)) onDroppedRef.current();
+        else fail(describeFailure(error));
+      });
+    }, delay);
+  }, [drop, fail]);
+
+  onDroppedRef.current = onDropped;
+
   /** Opens a call. Depends on `phase` only - see the note at the top. */
   useEffect(() => {
     if (phase !== "connecting") return undefined;
 
+    /**
+     * Fail FAST when the device knows it is offline.
+     *
+     * Without this the call sits on the orb for the client's full 10s timeout
+     * and then reports "The server is not responding", which sends the user
+     * looking at the laptop when the problem is the phone's own Wi-Fi. The
+     * store starts optimistic, so this only fires once `expo-network` has
+     * actually said otherwise.
+     */
+    if (!isOnline()) {
+      fail("No connection. Check Wi-Fi and try again");
+      return undefined;
+    }
+
     transcriptRef.current = emptyTranscript;
     setTranscript(emptyTranscript);
     answered.current = new Set();
+    latencyRef.current = new ReplyLatency();
+    reconnectsRef.current = 0;
 
     const deps: RealtimeSessionDeps = {
       webrtc: {
@@ -225,14 +359,13 @@ export function useCallSession(): readonly TranscriptLine[] {
        * `realtime-session` logs the session id and the model, never the
        * `clientSecret` - so keep it that way when adding a call.
        */
-      log: (message, detail) => {
-        console.log(`[call] ${message}`, detail ?? "");
-      },
+      log: logCall,
     };
 
     const session = new RealtimeSession(deps, {
       onReady,
       onEvent: (event) => onEventRef.current(event),
+      onDropped: () => onDroppedRef.current(),
       onFailure: fail,
     });
 
@@ -253,6 +386,24 @@ export function useCallSession(): readonly TranscriptLine[] {
    * "Ending" for that.
    */
   const settleAndRefresh = useCallback(() => {
+    /**
+     * One line per call with the reply latencies, so `scripts/call-metrics.mjs`
+     * can fill in the table without anyone timing a stopwatch against a phone.
+     */
+    const latencies = latencyRef.current.all();
+    if (latencies.length > 0) {
+      /**
+       * Deliberately does NOT repeat the individual samples: each was already
+       * logged as it happened, and a summary that re-lists them makes any
+       * reader that consumes both count every reply twice. This line is a
+       * human's quick read of the call; the per-reply lines are the data.
+       */
+      logCall("reply latency summary", {
+        samples: latencies.length,
+        medianMs: latencyRef.current.median(),
+      });
+    }
+
     const recorder = recorderRef.current;
     recorderRef.current = null;
 

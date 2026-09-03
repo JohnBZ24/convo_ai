@@ -65,7 +65,7 @@ even where the code had to be rewritten.
 | 4 | Expo app scaffold + UI shell + FIRST dev build on the Note 8 | **DONE** |
 | 5 | WebRTC audio on a real device | **BUILT + 2 device bugs fixed 3 Sep** — self-interruption test still open |
 | 6 | Transcripts, persistence, history screen | **DONE 3 Sep, verified on the Note 8** - plus rename, delete and search |
-| 7 | Hardening + measured latency over USB | Next |
+| 7 | Hardening + measured latency | **BUILT 3 Sep, measured on the Note 8** - reply-latency median still needs a human voice |
 
 ## State as of 20 Aug 2026 (sessions 2-3)
 
@@ -807,6 +807,146 @@ q=101 chars                  422
 
 Tests after iteration 6: **142 server, 78 mobile, 41 shared, 24 ai, 8 db**.
 
+### What iteration 7 actually built
+
+Hardening, and the measurement table filled in with numbers off the Note 8.
+
+#### A DROP is not a FAILURE, and that is the whole change
+
+Iteration 5 collapsed the two: `connectionstatechange` reaching `failed` called
+`onFailure`, so every momentary network blip became an error screen and a
+conversation the user had to restart. `RealtimeSession` now has separate
+`onDropped` and `onFailure`, and `open()` is split in half so `reconnect()` can
+rebuild only the second half.
+
+**The microphone is deliberately NOT reopened on a reconnect.** The mode a mic is
+opened in is what decides whether hardware echo cancellation is engaged - that
+is the entire reason `audio.begin()` runs before `getUserMedia` - so tearing it
+down mid-call risks coming back without it, and the model hearing itself through
+the loudspeaker is the failure this app exists to avoid. `realtime-session.test.ts`
+asserts the reconnect trace contains no `getUserMedia`, no `audio.begin` and no
+`api.createConversation`.
+
+Retries are `[0, 1000, 3000, 8000]ms`. The first is IMMEDIATE because most drops
+are already over by the time WebRTC reports them; the rest back off because a
+network that is genuinely down will still be down in 200ms. The budget resets on
+a successful reconnect, so a long call over flaky Wi-Fi keeps recovering while a
+connection that cannot be re-established gives up after ~12s.
+
+`disconnected` is ignored on purpose. WebRTC uses it for any gap in connectivity
+and recovers from most of them within seconds; renegotiating on the first one
+would turn a hiccup into a visible reconnect.
+
+#### The rest of the hardening
+
+- **`reconnecting` phase** in the call store. Keeps `conversationId` (the
+  transcript on screen belongs to it), keeps the orb engaged, and a tap still
+  hangs up - a user watching a call struggle means "stop", not "wait longer".
+- **`describeFailure()`** maps error codes to sentences a person can act on, and
+  REFUSES to show a library error: anything with a path, a URL, a stack frame or
+  over 80 characters falls back to a generic line. "Failed to construct
+  'RTCPeerConnection': {iceServers}" under the orb looks like the app broke
+  rather than the network.
+- **`isWorthRetrying()`** splits blips from refusals, so the reconnect loop does
+  not spend four attempts on a 401 that will fail identically every time.
+- **Offline** is a first-class state. The existing `expo-network` listener in
+  `_layout.tsx` now also feeds `network-store.ts` - one source of truth, not two
+  - plus an initial `getNetworkStateAsync()`, because the listener only fires on
+  a CHANGE and an app launched with Wi-Fi already off would never have heard.
+  The connect path fails fast instead of waiting out the client's 10s timeout
+  and then blaming the server.
+
+#### `~/` was not aliased in vitest
+
+A tested file importing `~/lib/api/client` typechecks, bundles and runs on the
+device, and fails ONLY under vitest with "Cannot find module". Fixed in
+`vitest.config.mts`. Same shape as every other trap in this file: something that
+works everywhere except the one place that checks it.
+
+#### Hermes does not log objects as JSON
+
+`console.log("[call] x", obj)` looks identical in Metro and is UNPARSEABLE in
+logcat: Hermes pretty-prints the object across several lines in JavaScript
+syntax - unquoted keys, single-quoted strings. A release build therefore emits
+something that is neither one line nor JSON.
+
+`logCall()` in `use-call-session.ts` stringifies the detail itself, which is what
+makes `scripts/call-metrics.mjs` work at all. Anything logged for a machine to
+read must go through it.
+
+Related, and found by testing rather than reasoning: the reply-latency SUMMARY
+line used to repeat the individual samples in `allMs`, and the script counted
+both - one real 366ms reply was reported as two samples of 366ms, which looks
+like corroboration and is the same measurement twice. The summary now carries
+only `samples` and `medianMs`; the per-reply lines are the data.
+
+#### `console.log` DOES reach logcat from a release build
+
+Worth recording, because it was assumed otherwise for an hour. A first probe
+found no `ReactNativeJS` lines and looked conclusive - the app was idle, and
+this app only logs during a call. Under the `ReactNativeJS` tag, a release
+build logs everything:
+
+```bash
+adb logcat -s ReactNativeJS
+```
+
+### Iteration 7's measurements - the Note 8, release build
+
+Four connects, driven with `adb shell input tap`, on Wi-Fi to a laptop on the
+same LAN. `node scripts/call-metrics.mjs` produced these from logcat.
+
+| Metric | Method | Target | Measured |
+|---|---|---|---|
+| UI thread FPS | Reanimated `PerformanceMonitor` | >= 58 | **60 idle, 60 in a live call** |
+| JS thread FPS | same, side by side | >= 45 | **60 idle, 58 in a live call** |
+| Frame times | `dumpsys gfxinfo` | cross-check | **50th 20ms, 90th 27ms, 95th 30ms, 99th 34ms** |
+| Jank | same | cross-check | **Slow UI thread 54 / 2424 frames (2.2%)** |
+| Tap -> first audio out | instrumented log timestamps | record | **2078ms median of 4** |
+| End of speech -> model audio | instrumented log timestamps | record | **366ms, one sample** |
+
+Where the connect time goes, median of four:
+
+```
+microphone permission                7 ms
+POST /api/conversations             68 ms
+getUserMedia                       303 ms
+createOffer + setLocalDescription  122 ms
+ICE gathering                      115 ms
+credential mint                    702 ms
+SDP exchange with OpenAI           790 ms
+-----------------------------------------
+tap -> first audio out            2078 ms   (median; 1756 / 1935 / 2220 / 4530)
+tap -> data channel live          3275 ms
+```
+
+Three things this says that guessing would not have:
+
+1. **The connect is two network round trips, not app code.** The mint and the
+   SDP exchange are ~1.5s of a ~2.1s connect; everything the device does itself
+   - permission, mic, offer, ICE - is about 550ms combined.
+2. **ICE gathering is normally 115ms, not the 2000ms ceiling** - but it DOES hit
+   the ceiling sometimes. One of four connects gathered for 2019ms and took
+   4530ms overall, which is the entire difference between that call and the
+   others. The ceiling is doing its job; do not remove it, and do not assume it
+   is free either.
+3. **`Janky frames: 81.44%` in `gfxinfo` is a red herring on this device.**
+   `Number High input latency` was 2339 of 2424 frames and accounts for nearly
+   all of it. The numbers that mean something are the percentiles and
+   `Slow UI thread` / `Frame deadline missed`, both around 2.5%.
+
+The frame-rate overlay is behind `EXPO_PUBLIC_PERF_OVERLAY` in
+`apps/mobile/.env`. It is OFF by default and must stay off for a demo build - it
+draws over the top-left corner. Metro inlines it, so changing it needs a rebuild.
+
+#### The reply-latency number is honest but thin
+
+366ms is a real measurement of a real reply: ambient noise in the room tripped
+server VAD and the model answered. It is ONE sample. The metric is instrumented
+and proven to work end to end; getting a median worth quoting needs someone to
+hold an actual conversation, which is the same person-shaped gap as iteration
+5's exit test.
+
 ### The demo runbook
 
 Cable is needed ONCE to install. After that the phone is on Wi-Fi only.
@@ -1021,13 +1161,14 @@ wastes a session chasing it.
   but `15.0.2` works on 57 — its peer range is `expo: ">=56"`. It adds `CAMERA`
   unconditionally, which `android.blockedPermissions` removes.
 
-### Where iteration 7 starts
+### What is left
 
-Audio is real, it comes out of the loudspeaker, and conversations are now stored,
-listed, searched, renamed, deleted and read back. Iteration 6 is closed.
+Audio is real, conversations are stored, listed, searched, renamed, deleted and
+read back, and the call recovers from a dropped connection. Iterations 6 and 7
+are built; everything still open needs a PERSON, not code.
 
-**Two things from earlier iterations are still open, and both need a person.**
-Neither is code:
+**Three things are still open, and every one of them needs a person in the
+room.** None is code:
 
 1. **The self-interruption test.** Talk to the phone and confirm the model does
    not cut itself off while its own voice is in the room. It is the exit
@@ -1039,12 +1180,18 @@ Neither is code:
    `search_conversations` (proxied) have never been exercised from a real call.
    The proxied one is now genuinely worth testing: before iteration 6 every
    conversation was empty, so the tool could only ever have returned nothing.
+3. **A reply-latency median.** One real sample (366ms) is instrumented and
+   proven; a number worth quoting needs a real conversation. Run
+   `node scripts/call-metrics.mjs` while holding one.
 
-Then iteration 7 proper - barge-in, credential expiry mid-call, reconnect after
-network loss, offline state, real error surfaces - and the measurement table in
-`DESIGN.md` filled in with real Note 8 numbers rather than claims.
+**Credential expiry mid-call needs no separate work, and that is deliberate.**
+The credential lives ~60s and the WebRTC connection outlives it, so expiry is a
+non-event. If the SESSION itself ends, the peer connection fails and the
+reconnect path above mints a new credential into the same conversation - which
+is the session handoff the design asked for, arrived at by making drops
+recoverable rather than by writing a second mechanism.
 
-Known gaps left deliberately in iteration 6:
+Known gaps left deliberately in iterations 6 and 7:
 
 - **Search is `ilike`, so it scans the user's turns.** Correct at this size and
   honest about it. The fix when it matters is a `tsvector` column with a GIN

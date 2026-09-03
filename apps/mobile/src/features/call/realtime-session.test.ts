@@ -116,6 +116,7 @@ interface Harness {
   tracks: { stopped: boolean }[];
   events: RealtimeEvent[];
   failures: string[];
+  drops: string[];
   ready: string[];
   deps: RealtimeSessionDeps;
 }
@@ -125,6 +126,7 @@ function harness(overrides: Partial<RealtimeSessionDeps> = {}): Harness {
   const tracks = [{ stopped: false }];
   const events: RealtimeEvent[] = [];
   const failures: string[] = [];
+  const drops: string[] = [];
   const ready: string[] = [];
 
   const deps: RealtimeSessionDeps = {
@@ -171,10 +173,11 @@ function harness(overrides: Partial<RealtimeSessionDeps> = {}): Harness {
   const session = new RealtimeSession(deps, {
     onReady: (id) => ready.push(id),
     onEvent: (event) => events.push(event),
+    onDropped: () => drops.push("dropped"),
     onFailure: (message) => failures.push(message),
   });
 
-  return { session, peer, tracks, events, failures, ready, deps };
+  return { session, peer, tracks, events, failures, drops, ready, deps };
 }
 
 beforeEach(() => {
@@ -237,7 +240,12 @@ describe("opening a call", () => {
           },
         },
       },
-      { onReady: () => {}, onEvent: () => {}, onFailure: () => {} },
+      {
+        onReady: () => {},
+        onEvent: () => {},
+        onDropped: () => {},
+        onFailure: () => {},
+      },
     );
 
     await session.open();
@@ -332,6 +340,7 @@ describe("failing to open", () => {
       {
         onReady: () => {},
         onEvent: () => {},
+        onDropped: () => {},
         onFailure: (message) => failures.push(message),
       },
     );
@@ -346,18 +355,171 @@ describe("failing to open", () => {
     expect(trace).toContain("api.endConversation");
   });
 
-  it("reports a dropped connection, but not a deliberate hang-up", async () => {
-    const { session, peer, failures } = harness();
+  /**
+   * A DROP is not a FAILURE, and iteration 7 split them apart on purpose. A
+   * drop is usually a phone changing Wi-Fi cell and should be recovered
+   * silently; a failure is something the user has to be told about. Reporting
+   * the first as the second - which iteration 5 did - turns every momentary
+   * blip into an error screen and a conversation the user has to restart.
+   */
+  it("reports a drop as a drop, not as a failure", async () => {
+    const { session, peer, drops, failures } = harness();
     await session.open();
 
     peer.connectionState = "failed";
     peer.emit("connectionstatechange");
-    expect(failures).toEqual(["The connection dropped"]);
+
+    expect(drops).toHaveLength(1);
+    expect(failures).toEqual([]);
+  });
+
+  it("says nothing about a deliberate hang-up", async () => {
+    const { session, peer, drops } = harness();
+    await session.open();
 
     await session.close();
     peer.connectionState = "closed";
     peer.emit("connectionstatechange");
-    expect(failures).toHaveLength(1);
+
+    expect(drops).toEqual([]);
+  });
+
+  /**
+   * `disconnected` is WebRTC's word for any gap in connectivity, and it
+   * recovers from most of them on its own within seconds. Renegotiating on the
+   * first one would turn a hiccup into a visible reconnect.
+   */
+  it("ignores `disconnected`, which usually heals itself", async () => {
+    const { session, peer, drops } = harness();
+    await session.open();
+
+    peer.connectionState = "disconnected";
+    peer.emit("connectionstatechange");
+
+    expect(drops).toEqual([]);
+  });
+
+  it("reports one drop per peer connection, however many events arrive", async () => {
+    const { session, peer, drops } = harness();
+    await session.open();
+
+    peer.connectionState = "failed";
+    peer.emit("connectionstatechange");
+    peer.emit("connectionstatechange");
+
+    expect(drops).toHaveLength(1);
+  });
+});
+
+describe("recovering a dropped call", () => {
+  /**
+   * THE reconnect test.
+   *
+   * The microphone must NOT be reopened. The mode a mic is opened in is what
+   * decides whether hardware echo cancellation is engaged - that is the whole
+   * reason `audio.begin()` runs before `getUserMedia` - so tearing it down
+   * mid-call risks coming back without it, and the model hearing itself
+   * through the loudspeaker is the failure this app is built to avoid.
+   */
+  it("rebuilds the peer without touching the microphone or the audio mode", async () => {
+    const { session } = harness();
+    await session.open();
+
+    trace = [];
+    await session.reconnect();
+
+    expect(trace).not.toContain("getUserMedia");
+    expect(trace).not.toContain("audio.begin");
+    expect(trace).not.toContain("requestMicrophone");
+    // A new peer, a new offer and a new credential - that is all it redoes.
+    expect(trace).toContain("peer.createOffer");
+    expect(trace).toContain("api.mintCredential");
+    expect(trace).toContain("api.postOffer");
+  });
+
+  /** The same conversation: the transcript on screen still belongs to it. */
+  it("keeps the conversation rather than opening a second one", async () => {
+    const { session } = harness();
+    await session.open();
+    const before = session.conversationId;
+
+    trace = [];
+    await session.reconnect();
+
+    expect(trace).not.toContain("api.createConversation");
+    expect(session.conversationId).toBe(before);
+  });
+
+  it("closes the old peer connection before building a new one", async () => {
+    const { session } = harness();
+    await session.open();
+
+    trace = [];
+    await session.reconnect();
+
+    expect(trace.indexOf("peer.close")).toBeLessThan(
+      trace.indexOf("peer.createDataChannel:oai-events"),
+    );
+  });
+
+  it("goes live again when the new data channel opens", async () => {
+    const { session, peer, ready } = harness();
+    await session.open();
+    peer.channel?.emit("open");
+    expect(ready).toEqual(["conv-1"]);
+
+    await session.reconnect();
+    peer.channel?.emit("open");
+
+    expect(ready).toEqual(["conv-1", "conv-1"]);
+  });
+
+  /**
+   * A reconnect that fails THROWS rather than reporting a failure, because the
+   * caller is the one deciding whether to try again - see `use-call-session`.
+   */
+  it("throws rather than reporting, so the caller can decide to retry", async () => {
+    let attempts = 0;
+    const { session } = harness({
+      api: {
+        createConversation: async () => "conv-1",
+        mintCredential: async () => {
+          attempts += 1;
+          if (attempts > 1) throw new Error("Could not reach the server");
+          return CREDENTIAL;
+        },
+        postOffer: async () => "v=0\r\nanswer",
+        endConversation: async () => undefined,
+      },
+    });
+
+    await session.open();
+
+    await expect(session.reconnect()).rejects.toThrow("Could not reach the server");
+  });
+
+  it("does nothing after the user has hung up", async () => {
+    const { session } = harness();
+    await session.open();
+    await session.close();
+
+    trace = [];
+    await session.reconnect();
+
+    expect(trace).toEqual([]);
+  });
+
+  it("gives the recovered connect its own timings", async () => {
+    const { session } = harness();
+    await session.open();
+    const first = session.timings;
+
+    await session.reconnect();
+
+    // The reconnect starts its clock fresh, so the microphone step it skipped
+    // reads as instant rather than inheriting the original connect's number.
+    expect(session.timings).not.toBe(first);
+    expect(session.timings.microphoneMs).toBe(0);
   });
 });
 
@@ -405,7 +567,12 @@ describe("closing a call", () => {
           },
         },
       },
-      { onReady: () => {}, onEvent: () => {}, onFailure: () => {} },
+      {
+        onReady: () => {},
+        onEvent: () => {},
+        onDropped: () => {},
+        onFailure: () => {},
+      },
     );
 
     await session.open();

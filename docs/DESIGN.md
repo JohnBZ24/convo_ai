@@ -1,10 +1,11 @@
 # Convo AI — Design & Build Plan
 
-**Status:** design agreed 20 Aug 2026. **Iterations 0–6 are built** — the backend, the
-Expo app, real WebRTC audio on the Note 8, and conversation persistence with a
-searchable history sidebar (verified on the device 3 Sep 2026). Iteration 5's exit
-test needs a human voice and is still open; see `HANDOFF.md`. Iteration 7
-(hardening and measured latency) is next.
+**Status:** design agreed 20 Aug 2026. **Iterations 0–7 are built** — the backend, the
+Expo app, real WebRTC audio on the Note 8, conversation persistence with a
+searchable history sidebar, and reconnect-on-drop with measured latency (all
+verified on the device 3 Sep 2026). What remains needs a person in the room, not
+code: iteration 5's self-interruption test, tool calls end to end, and a
+reply-latency median. See `HANDOFF.md`.
 **Read order:** `CLAUDE.md` (rules) → this file (design) → `HANDOFF.md` (verified facts, gotchas).
 
 > Two parts of this file describe a design that iteration 1 deliberately
@@ -529,23 +530,46 @@ multi-turn read-back is still worth doing by hand.
 
 ---
 
-### Iteration 7 — Hardening and measured latency over USB
+### Iteration 7 — Hardening and measured latency — **BUILT 3 Sep 2026**
 
 Barge-in, credential expiry mid-call (session handoff), reconnect after network
 loss, offline state, real error surfaces.
 
-Then **measure, and report numbers rather than claims**:
+Then **measure, and report numbers rather than claims**. Four connects on the
+Note 8, release build, over Wi-Fi, read out of logcat by
+`node scripts/call-metrics.mjs`:
 
-| Metric | Method | Target |
-|---|---|---|
-| UI thread FPS | Reanimated `PerformanceMonitor` | ≥ 58 |
-| JS thread FPS | same, side by side | ≥ 45 |
-| Frame times | `adb shell dumpsys gfxinfo com.abiroot.convoai framestats` | cross-check |
-| Jank, visual | Developer options → Profile HWUI rendering | cross-check |
-| Tap → first audio out | instrumented log timestamps | record |
-| End of speech → model audio | instrumented log timestamps | record |
+| Metric | Method | Target | Measured |
+|---|---|---|---|
+| UI thread FPS | Reanimated `PerformanceMonitor` | ≥ 58 | **60 idle, 60 in a live call** |
+| JS thread FPS | same, side by side | ≥ 45 | **60 idle, 58 in a live call** |
+| Frame times | `adb shell dumpsys gfxinfo com.abiroot.convoai` | cross-check | **50th 20ms, 90th 27ms, 95th 30ms, 99th 34ms** |
+| Jank | same | cross-check | **Slow UI thread 54 / 2424 frames (2.2%)** |
+| Tap → first audio out | instrumented log timestamps | record | **2078 ms** (median of 4) |
+| End of speech → model audio | instrumented log timestamps | record | **366 ms** (one sample) |
+
+Where the connect time goes, median of four:
+
+```
+microphone permission                7 ms
+POST /api/conversations             68 ms
+getUserMedia                       303 ms
+createOffer + setLocalDescription  122 ms
+ICE gathering                      115 ms
+credential mint                    702 ms
+SDP exchange with OpenAI           790 ms
+```
+
+The connect is two network round trips, not app code: the mint and the SDP
+exchange are ~1.5s of a ~2.1s connect, while everything the device does itself
+is about 550ms. ICE gathering is normally 115ms but DID hit its 2000ms ceiling
+on one of the four, which was the entire difference between that connect and
+the others.
 
 **Exit test:** the table above, filled in with real measurements from the Note 8.
+**Status:** every row has a real number. The reply-latency figure is one sample
+- a real reply, triggered by room noise - and a median worth quoting still needs
+someone to hold a conversation. See `HANDOFF.md`.
 
 ---
 

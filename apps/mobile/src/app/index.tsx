@@ -14,6 +14,7 @@ import {
 import { Orb } from "~/features/call/orb";
 import { Transcript } from "~/features/call/transcript";
 import { useCallSession } from "~/features/call/use-call-session";
+import { useNetworkStore } from "~/features/network/network-store";
 import {
   colors,
   ORB_BASE_DIAMETER,
@@ -44,6 +45,7 @@ export default function VoiceScreen() {
   const stop = useCallStore((state) => state.stop);
   const dismissError = useCallStore((state) => state.dismissError);
   const signOut = useAuthStore((state) => state.signOut);
+  const online = useNetworkStore((state) => state.online);
 
   /**
    * The real thing: this opens the WebRTC connection when the machine reaches
@@ -62,7 +64,12 @@ export default function VoiceScreen() {
       dismissError();
       return;
     }
-    if (phase === "live") {
+    /**
+     * `reconnecting` hangs up too. A user watching a call try to come back and
+     * tapping the orb means "stop", not "wait longer" - and the store allows
+     * the transition for exactly that reason.
+     */
+    if (phase === "live" || phase === "reconnecting") {
       stop();
       return;
     }
@@ -176,7 +183,9 @@ export default function VoiceScreen() {
 
         <View style={[styles.orbSlot, { marginTop: orbTop }]}>
           <Orb phase={phase} activity={activity} onPress={onOrbPress} />
-          <Text style={styles.status}>{statusLabel(phase, activity, error)}</Text>
+          <Text style={styles.status}>
+            {statusLabel(phase, activity, error, online)}
+          </Text>
         </View>
 
         <View style={styles.transcript}>
@@ -196,9 +205,16 @@ function statusLabel(
   phase: CallPhase,
   activity: CallActivity,
   error: string | null,
+  online: boolean,
 ): string {
   if (phase === "error") return error ?? "Something went wrong";
   if (phase === "connecting") return "Connecting";
+  /**
+   * Named, not hidden behind "Connecting". A call that goes quiet for two
+   * seconds and says nothing looks broken; one that says "Reconnecting" is
+   * obviously working on it, and the transcript is still on screen underneath.
+   */
+  if (phase === "reconnecting") return "Reconnecting";
   if (phase === "ending") return "Ending";
 
   if (phase === "live") {
@@ -206,6 +222,9 @@ function statusLabel(
     if (activity === "speaking") return "Speaking";
     return "Listening";
   }
+
+  // Idle and offline: say so before the tap, not after a ten-second timeout.
+  if (!online) return "No connection";
 
   return "Tap to talk";
 }

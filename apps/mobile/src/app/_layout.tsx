@@ -10,9 +10,22 @@ import { StatusBar } from "expo-status-bar";
 import { useEffect, useRef, useState } from "react";
 import { AppState, type AppStateStatus } from "react-native";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
+import { PerformanceMonitor } from "react-native-reanimated";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 import { useAuthStore } from "~/features/auth/auth-store";
+import { useNetworkStore } from "~/features/network/network-store";
 import { colors } from "~/theme/tokens";
+
+/**
+ * The UI/JS frame-rate overlay, for iteration 7's measurement table.
+ *
+ * Behind a build-time flag rather than a dev-only check, because the numbers
+ * that matter are a RELEASE build's - a dev build carries the bridge's
+ * debugging overhead and would report a frame rate the user never sees. Set
+ * `EXPO_PUBLIC_PERF_OVERLAY=true` in `apps/mobile/.env` and rebuild; Metro
+ * inlines it, so this costs nothing in a normal build.
+ */
+const SHOW_PERFORMANCE_OVERLAY = process.env.EXPO_PUBLIC_PERF_OVERLAY === "true";
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -42,9 +55,24 @@ function useQueryPlatformBridges() {
   }, []);
 
   useEffect(() => {
-    const subscription = Network.addNetworkStateListener((state) => {
-      onlineManager.setOnline(Boolean(state.isInternetReachable ?? state.isConnected));
-    });
+    const apply = (state: { isInternetReachable?: boolean; isConnected?: boolean }) => {
+      const online = Boolean(state.isInternetReachable ?? state.isConnected);
+      onlineManager.setOnline(online);
+      // The SAME reading drives the call screen. Two subscriptions would be two
+      // sources of truth that can disagree, and the user would see whichever
+      // updated last.
+      useNetworkStore.getState().setOnline(online);
+    };
+
+    /**
+     * Ask once as well as subscribing. The listener only fires on a CHANGE, so
+     * an app launched with Wi-Fi already off would never hear about it.
+     */
+    void Network.getNetworkStateAsync()
+      .then(apply)
+      .catch(() => undefined);
+
+    const subscription = Network.addNetworkStateListener(apply);
 
     return () => subscription.remove();
   }, []);
@@ -118,6 +146,7 @@ export default function RootLayout() {
               animation: restoreStarted ? "default" : "none",
             }}
           />
+          {SHOW_PERFORMANCE_OVERLAY ? <PerformanceMonitor /> : null}
         </QueryClientProvider>
       </SafeAreaProvider>
     </GestureHandlerRootView>

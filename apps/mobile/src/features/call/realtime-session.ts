@@ -1,4 +1,6 @@
 import type { RealtimeCredential } from "@convo/shared";
+import { CallTimeline } from "./call-metrics";
+import { describeFailure } from "./failure-message";
 import { type RealtimeEvent, toRealtimeEvent } from "./realtime-events";
 
 /**
@@ -61,12 +63,24 @@ export interface RealtimeSessionDeps {
   log: (message: string, detail?: Record<string, unknown>) => void;
   /** Ceiling on the ICE gathering wait. See `open()`. */
   iceGatheringTimeoutMs?: number;
+  /** Injected so the connect timings can be asserted without a real clock. */
+  now?: () => number;
 }
 
 export interface RealtimeSessionHandlers {
   /** The data channel is open: the call is live. */
   onReady: (conversationId: string) => void;
   onEvent: (event: RealtimeEvent) => void;
+  /**
+   * The connection died mid-call and MIGHT come back.
+   *
+   * Separate from `onFailure` because the two want different responses: a drop
+   * is a phone that changed Wi-Fi cell and should be recovered silently, while
+   * a failure is something the user has to be told about. Collapsing them - as
+   * iteration 5 did - turns every momentary network blip into an error screen
+   * and a conversation the user has to restart.
+   */
+  onDropped: () => void;
   onFailure: (message: string) => void;
 }
 
@@ -81,14 +95,29 @@ export class RealtimeSession {
   private closed = false;
   /** So a teardown that runs twice does not stop audio focus it never took. */
   private audioActive = false;
+  /** Guards against a drop reported twice for the same peer connection. */
+  private dropReported = false;
+
+  /**
+   * Timings for the CURRENT connect. A reconnect gets a fresh one, so a
+   * recovered call cannot rewrite the numbers of the connect before it.
+   */
+  private timeline: CallTimeline;
 
   constructor(
     private readonly deps: RealtimeSessionDeps,
     private readonly handlers: RealtimeSessionHandlers,
-  ) {}
+  ) {
+    this.timeline = new CallTimeline(deps.now);
+  }
 
   get conversationId(): string | null {
     return this.conversation;
+  }
+
+  /** The connect timings, for the metrics log line and for tests. */
+  get timings() {
+    return this.timeline.timings();
   }
 
   /**
@@ -100,15 +129,19 @@ export class RealtimeSession {
    * seconds later - by which time the connection it opened has outlived it.
    */
   async open(): Promise<void> {
+    this.timeline.mark("tap");
+
     try {
       const granted = await this.deps.requestMicrophone();
       if (!granted) {
         this.handlers.onFailure("Convo needs the microphone to hear you");
         return;
       }
+      this.timeline.mark("permission");
       if (this.abandoned()) return;
 
       this.conversation = await this.deps.api.createConversation();
+      this.timeline.mark("conversation");
       if (this.abandoned()) return;
 
       /**
@@ -119,58 +152,13 @@ export class RealtimeSession {
        */
       this.deps.audio.begin();
       this.audioActive = true;
+      this.timeline.mark("audioMode");
 
       this.stream = await this.deps.webrtc.getUserMedia();
+      this.timeline.mark("microphone");
       if (this.abandoned()) return;
 
-      const peer = this.deps.webrtc.createPeerConnection();
-      this.peer = peer;
-
-      for (const track of this.stream.getAudioTracks()) {
-        peer.addTrack(track, this.stream);
-      }
-
-      const channel = peer.createDataChannel(DATA_CHANNEL_LABEL);
-      this.channel = channel;
-      this.wireChannel(channel);
-      this.wireConnectionState(peer);
-
-      const offer = await peer.createOffer();
-      await peer.setLocalDescription(offer);
-      if (this.abandoned()) return;
-
-      /**
-       * The browser-versus-React-Native trap.
-       *
-       * Every published OpenAI sample POSTs the SDP straight after
-       * `setLocalDescription`. In a browser that is fine. Here the promise
-       * resolves before ICE candidates are gathered, and an offer with no
-       * candidates negotiates happily and then never connects - which presents
-       * as a call that reaches `live` and stays silent.
-       */
-      await this.waitForIceGathering(peer);
-      if (this.abandoned()) return;
-
-      const localSdp = peer.localDescription?.sdp ?? offer.sdp;
-
-      // ---- the credential's clock starts here ----
-      const credential = await this.deps.api.mintCredential(this.conversation);
-      if (this.abandoned()) return;
-
-      this.deps.log("realtime credential minted", {
-        sessionId: credential.sessionId,
-        model: credential.model,
-        expiresInSeconds: credential.expiresInSeconds,
-      });
-
-      const answerSdp = await this.deps.api.postOffer(
-        credential.callsUrl,
-        credential.clientSecret,
-        localSdp,
-      );
-      if (this.abandoned()) return;
-
-      await peer.setRemoteDescription({ type: "answer", sdp: answerSdp });
+      await this.negotiate();
     } catch (error) {
       /**
        * `close()`, not just a media release: a conversation was very likely
@@ -178,8 +166,108 @@ export class RealtimeSession {
        * rate limited would be a row nothing ever tidies up.
        */
       await this.close();
-      this.handlers.onFailure(describe(error));
+      this.handlers.onFailure(describeFailure(error));
     }
+  }
+
+  /**
+   * Rebuild the peer connection for a call that dropped.
+   *
+   * Deliberately does NOT redo the slow half: the permission is granted, the
+   * conversation exists, `MODE_IN_COMMUNICATION` is still set and the
+   * microphone is still open. Reopening the mic would be the worst thing to do
+   * here - the audio mode it is opened in decides whether hardware echo
+   * cancellation is engaged, and tearing that down mid-call risks coming back
+   * without it.
+   *
+   * Throws on failure rather than reporting it, so the caller can decide
+   * whether to try again or give up. See `use-call-session`.
+   */
+  async reconnect(): Promise<void> {
+    if (this.closed) return;
+    if (!this.conversation || !this.stream) {
+      throw new Error("Nothing to reconnect to");
+    }
+
+    this.deps.log("reconnecting the call", { conversationId: this.conversation });
+
+    // A fresh timeline: this connect's numbers are its own.
+    this.timeline = new CallTimeline(this.deps.now);
+    this.timeline.mark("tap");
+    this.timeline.mark("permission");
+    this.timeline.mark("conversation");
+    this.timeline.mark("audioMode");
+    this.timeline.mark("microphone");
+
+    this.discardPeer();
+    await this.negotiate();
+  }
+
+  /**
+   * Peer connection, offer, credential, answer.
+   *
+   * Split out of `open()` so `reconnect()` can run exactly this half again
+   * against the microphone that is already open.
+   */
+  private async negotiate(): Promise<void> {
+    const stream = this.stream;
+    const conversation = this.conversation;
+    if (!stream || !conversation) throw new Error("Nothing to negotiate with");
+
+    const peer = this.deps.webrtc.createPeerConnection();
+    this.peer = peer;
+    this.dropReported = false;
+
+    for (const track of stream.getAudioTracks()) {
+      peer.addTrack(track, stream);
+    }
+
+    const channel = peer.createDataChannel(DATA_CHANNEL_LABEL);
+    this.channel = channel;
+    this.wireChannel(channel);
+    this.wireConnectionState(peer);
+    this.wireRemoteTrack(peer);
+
+    const offer = await peer.createOffer();
+    await peer.setLocalDescription(offer);
+    this.timeline.mark("offer");
+    if (this.abandoned()) return;
+
+    /**
+     * The browser-versus-React-Native trap.
+     *
+     * Every published OpenAI sample POSTs the SDP straight after
+     * `setLocalDescription`. In a browser that is fine. Here the promise
+     * resolves before ICE candidates are gathered, and an offer with no
+     * candidates negotiates happily and then never connects - which presents
+     * as a call that reaches `live` and stays silent.
+     */
+    await this.waitForIceGathering(peer);
+    this.timeline.mark("iceComplete");
+    if (this.abandoned()) return;
+
+    const localSdp = peer.localDescription?.sdp ?? offer.sdp;
+
+    // ---- the credential's clock starts here ----
+    const credential = await this.deps.api.mintCredential(conversation);
+    this.timeline.mark("credential");
+    if (this.abandoned()) return;
+
+    this.deps.log("realtime credential minted", {
+      sessionId: credential.sessionId,
+      model: credential.model,
+      expiresInSeconds: credential.expiresInSeconds,
+    });
+
+    const answerSdp = await this.deps.api.postOffer(
+      credential.callsUrl,
+      credential.clientSecret,
+      localSdp,
+    );
+    if (this.abandoned()) return;
+
+    await peer.setRemoteDescription({ type: "answer", sdp: answerSdp });
+    this.timeline.mark("answer");
   }
 
   /** Safe to call twice, and safe to call while `open()` is still running. */
@@ -200,7 +288,7 @@ export class RealtimeSession {
        * is a tidiness problem; a UI stuck in `ending` is a broken app.
        */
       this.deps.log("could not mark the conversation ended", {
-        error: describe(error),
+        error: describeFailure(error),
       });
     }
   }
@@ -243,6 +331,12 @@ export class RealtimeSession {
     channel.addEventListener("open", () => {
       const conversationId = this.conversation;
       if (this.closed || !conversationId) return;
+
+      this.timeline.mark("live");
+      // One line per connect, with the whole breakdown. This is what
+      // `scripts/call-metrics.mjs` reads out of logcat.
+      this.deps.log("call connected", this.timeline.recorded());
+
       this.handlers.onReady(conversationId);
     });
 
@@ -261,13 +355,34 @@ export class RealtimeSession {
     });
   }
 
+  /**
+   * `ontrack` is the first remote audio, and therefore the honest end of
+   * "tap to first audio out" - the number in the design's table. Nothing else
+   * needs the event; the audio plays itself.
+   */
+  private wireRemoteTrack(peer: MinimalPeerConnection): void {
+    peer.addEventListener("track", () => {
+      if (this.closed) return;
+      this.timeline.mark("remoteAudio");
+    });
+  }
+
   private wireConnectionState(peer: MinimalPeerConnection): void {
     peer.addEventListener("connectionstatechange", () => {
       // A deliberate hang-up also moves through `closed`. Only report a drop.
-      if (this.closed) return;
+      if (this.closed || this.dropReported) return;
+      if (peer !== this.peer) return;
 
+      /**
+       * `failed` only, not `disconnected`. WebRTC reports `disconnected` for
+       * any gap in connectivity and recovers from most of them on its own
+       * within a few seconds; tearing the peer down and renegotiating on the
+       * first one would turn a hiccup into a visible reconnect.
+       */
       if (peer.connectionState === "failed") {
-        this.handlers.onFailure("The connection dropped");
+        this.dropReported = true;
+        this.deps.log("the connection dropped");
+        this.handlers.onDropped();
       }
     });
   }
@@ -304,6 +419,19 @@ export class RealtimeSession {
     return true;
   }
 
+  /**
+   * Throw away the peer connection and data channel, KEEPING the microphone,
+   * the audio mode and the conversation. This is the half of a teardown that a
+   * reconnect needs; `releaseMedia` is the whole thing.
+   */
+  private discardPeer(): void {
+    this.channel?.close();
+    this.channel = null;
+
+    this.peer?.close();
+    this.peer = null;
+  }
+
   private releaseMedia(): void {
     // Tracks first: this is what turns off the microphone indicator.
     for (const track of this.stream?.getTracks() ?? []) {
@@ -311,20 +439,11 @@ export class RealtimeSession {
     }
     this.stream = null;
 
-    this.channel?.close();
-    this.channel = null;
-
-    this.peer?.close();
-    this.peer = null;
+    this.discardPeer();
 
     if (this.audioActive) {
       this.audioActive = false;
       this.deps.audio.end();
     }
   }
-}
-
-function describe(error: unknown): string {
-  if (error instanceof Error && error.message) return error.message;
-  return "Could not start the conversation";
 }

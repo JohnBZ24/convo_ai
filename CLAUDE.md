@@ -240,6 +240,8 @@ instinct as the server's ports, for the same reason plus one practical one.
 | `realtime-session.ts` | no | ✅ the connect ORDER |
 | `device-tools.ts` | no | ✅ device vs proxied routing |
 | `turn-recorder.ts` | no | ✅ seq assignment + retry |
+| `call-metrics.ts` | no | ✅ connect + reply timings |
+| `failure-message.ts` | no | ✅ error → what the user reads |
 | `webrtc-adapter.ts` | **yes** — `react-native-webrtc` | — |
 | `audio-route.ts` | **yes** — `react-native-incall-manager` | — |
 | `use-call-session.ts` | **yes** — the React wiring | — |
@@ -323,6 +325,60 @@ Two React Native traps in this code, both of the "curl is not a phone" family:
 query strings are built by hand; and a release build's JS bundle is written by
 Expo in the first ~30 seconds, so **source edited after `expo run:android`
 starts is silently absent from the APK** while the build still reports success.
+
+## Recovering a dropped call
+
+A **drop** and a **failure** are different things, and iteration 7 split them
+apart. `RealtimeSession` reports `onDropped` for a connection that died and might
+come back, and `onFailure` for something the user has to be told about.
+Collapsing them — which iteration 5 did — turns every momentary network blip
+into an error screen and a conversation the user has to restart.
+
+**A reconnect must NOT reopen the microphone.** `open()` is split so
+`reconnect()` redoes only the peer connection, offer, mint and answer. The mode
+a mic is opened in decides whether hardware echo cancellation is engaged — that
+is why `audio.begin()` runs before `getUserMedia` — so tearing it down mid-call
+risks coming back without it, and the model hearing itself through the
+loudspeaker is the failure this app exists to avoid. A test asserts the
+reconnect trace contains no `getUserMedia` and no `audio.begin`.
+
+Retries are `[0, 1000, 3000, 8000]ms`; the first is immediate because most drops
+are already over by the time WebRTC reports them. `disconnected` is ignored —
+WebRTC uses it for any gap and heals most on its own. The budget resets on a
+successful reconnect. **Credential expiry mid-call needs no separate mechanism:**
+the credential lives ~60s and the connection outlives it, and if the session
+itself ends the peer fails and this same path mints a new one.
+
+Failures reach the user through `describeFailure()`, which refuses to show a
+library error — anything with a path, a URL, a stack frame or over 80 characters
+becomes a generic line, because "Failed to construct 'RTCPeerConnection'" under
+the orb looks like the app broke rather than the network.
+
+## Measuring the app
+
+`features/call/call-metrics.ts` times every connect and every reply;
+`scripts/call-metrics.mjs` turns the log lines into the table in `DESIGN.md`.
+
+```bash
+adb logcat -s ReactNativeJS        # a RELEASE build does log here
+node scripts/call-metrics.mjs      # live, Ctrl-C for the table
+```
+
+Two traps, both found the hard way:
+
+- **Hermes does not log objects as JSON.** `console.log("x", obj)` looks fine in
+  Metro and is unparseable in logcat: it pretty-prints across several lines in
+  JavaScript syntax, unquoted keys and single-quoted strings. Anything meant to
+  be read by a machine goes through `logCall()` in `use-call-session.ts`, which
+  stringifies the detail itself.
+- **Do not log the same measurement twice.** The reply-latency summary line
+  carries only a count and a median; the per-reply lines are the data. A summary
+  that repeats the samples makes any reader that consumes both count every reply
+  twice, which looks like corroboration.
+
+The JS/UI frame-rate overlay is `EXPO_PUBLIC_PERF_OVERLAY` in
+`apps/mobile/.env`. **Off for anything but measuring** — it draws over the
+top-left corner, and Metro inlines it, so changing it needs a rebuild.
 
 ## Health endpoints
 
